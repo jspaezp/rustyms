@@ -92,9 +92,9 @@ impl<CV: CVSource> CVIndex<CV> {
     /// Store this index as a gzip compressed static database at a certain location.
     ///
     /// This is the format that is embedded in the binary at compile time and read back with
-    /// [`crate::decompress_static_data`]. It is deliberately separate from [`Self::save_to_cache_at`]
-    /// so that the runtime cache stays uncompressed and caches written by older versions stay
-    /// readable.
+    /// [`crate::decompress_static_data`]. It is deliberately separate from
+    /// [`Self::save_to_cache_at`] so that the runtime cache stays uncompressed and caches
+    /// written by older versions stay readable.
     /// # Errors
     /// If the file could not be written to.
     pub fn save_to_static_data_at(&self, path: &Path) -> Result<(), BoxedError<'static, CVError>> {
