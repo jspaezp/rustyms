@@ -11,6 +11,7 @@ mod load;
 #[cfg(feature = "http")]
 mod lzw;
 mod obo;
+mod static_data;
 pub mod text;
 
 pub use curie::*;
@@ -19,3 +20,4 @@ pub use cv_index::*;
 pub use cv_source::*;
 pub use hash_buf_reader::*;
 pub use obo::*;
+pub use static_data::*;

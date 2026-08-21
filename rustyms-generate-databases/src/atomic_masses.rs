@@ -138,7 +138,7 @@ pub(crate) fn build_atomic_masses(out_dir: &Path) {
 
     // Write out the data
     let dest_path = Path::new(&out_dir).join("elements.dat");
-    let mut file = std::fs::File::create(dest_path).unwrap();
+    let file = std::fs::File::create(dest_path).unwrap();
     let elements = combined_data
         .into_iter()
         .map(|(m, a, i)| {
@@ -149,6 +149,9 @@ pub(crate) fn build_atomic_masses(out_dir: &Path) {
             )
         })
         .collect();
+    // Stored gzip compressed because this is embedded in the binary at compile time, see
+    // `mzcv::decompress_static_data`.
+    let mut file = flate2::write::GzEncoder::new(file, flate2::Compression::best());
     file.write_all(
         &bincode::serde::encode_to_vec::<ElementalData, Configuration>(
             elements,
@@ -157,6 +160,7 @@ pub(crate) fn build_atomic_masses(out_dir: &Path) {
         .unwrap(),
     )
     .unwrap();
+    file.finish().unwrap();
 }
 
 /// Get the number out of a CIAAW number with uncertainty defined.

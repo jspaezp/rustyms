@@ -47,7 +47,7 @@ impl CVSource for Unimod {
         {
             use bincode::config::Configuration;
             let cache = bincode::decode_from_slice::<(CVVersion, Self::Structure), Configuration>(
-                include_bytes!("../databases/unimod.dat"),
+                &mzcv::decompress_static_data(include_bytes!("../databases/unimod.dat")),
                 Configuration::default(),
             )
             .unwrap()

@@ -89,6 +89,49 @@ impl<CV: CVSource> CVIndex<CV> {
         Ok(())
     }
 
+    /// Store this index as a gzip compressed static database at a certain location.
+    ///
+    /// This is the format that is embedded in the binary at compile time and read back with
+    /// [`crate::decompress_static_data`]. It is deliberately separate from [`Self::save_to_cache_at`]
+    /// so that the runtime cache stays uncompressed and caches written by older versions stay
+    /// readable.
+    /// # Errors
+    /// If the file could not be written to.
+    pub fn save_to_static_data_at(&self, path: &Path) -> Result<(), BoxedError<'static, CVError>> {
+        let file = std::fs::File::create(path).map_err(|e| {
+            BoxedError::new(
+                CVError::CacheCouldNotBeOpenend,
+                "CV static database file could not be openend",
+                e.to_string(),
+                Context::default().source(path.to_string_lossy()).to_owned(),
+            )
+        })?;
+        let mut writer =
+            flate2::write::GzEncoder::new(BufWriter::new(file), flate2::Compression::best());
+        bincode::encode_into_std_write(
+            (self.version().clone(), self.data()),
+            &mut writer,
+            bincode::config::standard(),
+        )
+        .map_err(|e| {
+            BoxedError::new(
+                CVError::CacheCouldNotBeMade,
+                "CV static database file could not be made",
+                e.to_string(),
+                Context::default().source(path.to_string_lossy()).to_owned(),
+            )
+        })?;
+        writer.finish().map_err(|e| {
+            BoxedError::new(
+                CVError::CacheCouldNotBeMade,
+                "CV static database file could not be compressed",
+                e.to_string(),
+                Context::default().source(path.to_string_lossy()).to_owned(),
+            )
+        })?;
+        Ok(())
+    }
+
     /// Store the uncompressed file at a certain location.
     /// # Errors
     /// If the file could not be written to.

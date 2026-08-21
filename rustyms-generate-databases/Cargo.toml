@@ -10,6 +10,7 @@ publish = false
 mzcore = { path = "../mzcore", features = ["internal-no-data"] }
 
 bincode = { workspace = true }
+flate2 = { workspace = true }
 
 [features]
 rayon = []

@@ -52,7 +52,7 @@ impl CVSource for XlMod {
         {
             use bincode::config::Configuration;
             let cache = bincode::decode_from_slice::<(CVVersion, Self::Structure), Configuration>(
-                include_bytes!("../databases/xlmod.dat"),
+                &mzcv::decompress_static_data(include_bytes!("../databases/xlmod.dat")),
                 Configuration::default(),
             )
             .unwrap()

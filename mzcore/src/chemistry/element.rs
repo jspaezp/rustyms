@@ -914,7 +914,7 @@ pub static ELEMENTAL_DATA: LazyLock<ElementalData> = LazyLock::new(|| {
     #[cfg(not(feature = "internal-no-data"))]
     {
         bincode::serde::decode_from_slice::<ElementalData, bincode::config::Configuration>(
-            include_bytes!("../databases/elements.dat"),
+            &mzcv::decompress_static_data(include_bytes!("../databases/elements.dat")),
             bincode::config::Configuration::default(),
         )
         .unwrap()
