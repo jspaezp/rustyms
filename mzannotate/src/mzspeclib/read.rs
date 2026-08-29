@@ -103,9 +103,6 @@ impl ErrorKind for MzSpecLibErrorKind {
 pub struct MzSpecLibTextParser<'ontologies, Reader: Read> {
     inner: Reader,
     header: LibraryHeader,
-    /// The attribute sets from the header, keeping the source [`Context`] of every attribute so
-    /// that inherited attributes can still produce good error messages. Ordered, because §4.1.11
-    /// precedence depends on the order sets are claimed and defined.
     header_attribute_sets_with_context: HashMap<EntryType, AttributeSets>,
     state: ParserState,
     line_cache: VecDeque<String>,
@@ -848,7 +845,6 @@ impl<'ontologies, R: BufRead> MzSpecLibTextParser<'ontologies, R> {
             }
         }
 
-        // TODO: try to interpret the merged attributes as well.
         interp.attributes = flatten_attribute_groups(&resolve_attribute_sets(
             &term_collection,
             self.header_attribute_sets_with_context.get(&EntryType::Interpretation),
@@ -1047,8 +1043,6 @@ impl<'ontologies, R: BufRead> MzSpecLibTextParser<'ontologies, R> {
             }
         }
 
-        // Resolve the claimed attribute sets before interpreting anything, so that a term defined
-        // by several sources reaches the description exactly once, with the winning value.
         let attributes = resolve_attribute_sets(
             &term_collection,
             self.header_attribute_sets_with_context.get(&EntryType::Spectrum),
