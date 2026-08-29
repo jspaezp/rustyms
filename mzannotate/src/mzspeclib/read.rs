@@ -1492,6 +1492,73 @@ mod test {
     }
 
     #[test]
+    fn spectrum_applies_claimed_attribute_set() {
+        let text = r"<mzSpecLib>
+MS:1003186|library format version=1.0
+<AttributeSet Spectrum=all>
+MS:1003072|spectrum origin type=MS:1003073|observed spectrum
+<AttributeSet Spectrum=decoy>
+MS:1003072|spectrum origin type=MS:1003195|shuffle-and-reposition decoy spectrum
+<Spectrum=1>
+MS:1003212|library attribute set name=decoy
+<Peaks>";
+
+        let spectrum = MzSpecLibTextParser::open(
+            text.as_bytes(),
+            None,
+            &mzcore::ontology::STATIC_ONTOLOGIES,
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        let origins: Vec<_> = spectrum
+            .description
+            .params
+            .iter()
+            .filter(|param| {
+                param.curie()
+                    .is_some_and(|curie| curie.to_string() == "MS:1003072")
+            })
+            .map(|param| param.value.to_string())
+            .collect();
+
+        assert_eq!(
+            origins,
+            ["MS:1003195|shuffle-and-reposition decoy spectrum"]
+        );
+    }
+
+    #[test]
+    fn interpretation_inherits_all_without_a_claim() {
+        let text = r"<mzSpecLib>
+MS:1003186|library format version=1.0
+<AttributeSet Interpretation=all>
+MS:1002252|Comet:xcorr=2.0
+<Spectrum=1>
+<Interpretation=1>
+<Peaks>";
+
+        let spectrum = MzSpecLibTextParser::open(
+            text.as_bytes(),
+            None,
+            &mzcore::ontology::STATIC_ONTOLOGIES,
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            spectrum.interpretations[0].attributes[0],
+            [Attribute::new(
+                term!(MS:1002252|Comet:xcorr),
+                AttributeValue::from_scalar(2.0),
+            )]
+        );
+    }
+
+    #[test]
     fn unknown_cv_value() {
         let text = r"<mzSpecLib>
 MS:1003186|library format version=UW:0000000|text";

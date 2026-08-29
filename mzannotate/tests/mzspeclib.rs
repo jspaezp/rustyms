@@ -66,31 +66,6 @@ fn read_all_files() {
                 }
             }
 
-            if entry.file_name() == "fetal_brain_tiny_consensus_td.mzSpecLib.txt" {
-                for spectrum in &parsed_spectra {
-                    let decoy = spectrum.attributes.iter().flatten().any(|attribute| {
-                        attribute.name == mzcv::term!(MS:1003212|library attribute set name)
-                            && attribute.value.to_string() == "DECOY"
-                    });
-                    let origin: Vec<_> = spectrum
-                        .description
-                        .params
-                        .iter()
-                        .filter(|param| {
-                            param.curie()
-                                .is_some_and(|curie| curie.to_string() == "MS:1003072")
-                        })
-                        .map(|param| param.value.to_string())
-                        .collect();
-                    let expected = if decoy {
-                        "MS:1003195|shuffle-and-reposition decoy spectrum"
-                    } else {
-                        "MS:1003073|observed spectrum"
-                    };
-                    assert_eq!(origin, [expected]);
-                }
-            }
-
             let rewrite_path = entry.path().with_extension("txt.out");
             let mut writer = MzSpecLibTextWriter::new(std::io::BufWriter::new(
                 std::fs::File::create(&rewrite_path).unwrap(),
