@@ -287,7 +287,7 @@ pub(crate) fn populate_spectrum_description_from_attributes<'a>(
 
             if let Some((Attribute { value, .. }, context)) =
                 group.iter().find(|a| a.0.name.accession == curie!(MS:1000894))
-                && group.len() == 2
+                && group.len() >= 2
             {
                 description.acquisition.scans[0].start_time =
                     f64::from(value.scalar().to_f32().map_err(|v| {
@@ -305,12 +305,14 @@ pub(crate) fn populate_spectrum_description_from_attributes<'a>(
                             context.clone(),
                         )
                     })? {
-                        Unit::Minute => 60.0,
-                        _ => 1.0, // Assume seconds for anything else
+                        Unit::Minute => 1.0,
+                        // `ScanEvent::start_time` is minutes, so a value in
+                        // any other unit is seconds-like and converts.
+                        _ => 60.0,
                     };
             } else if let Some((Attribute { value, .. }, context)) =
                 group.iter().find(|a| a.0.name.accession == curie!(MS:1000896))
-                && group.len() == 2
+                && group.len() >= 2
             {
                 let rt = f64::from(value.scalar().to_f32().map_err(|v| {
                     BoxedError::new(
@@ -327,8 +329,10 @@ pub(crate) fn populate_spectrum_description_from_attributes<'a>(
                         context.clone(),
                     )
                 })? {
-                    Unit::Minute => 60.0,
-                    _ => 1.0, // Assume seconds for anything else
+                    Unit::Minute => 1.0,
+                    // `ScanEvent::start_time` is minutes, so a value in any
+                    // other unit is seconds-like and converts.
+                    _ => 60.0,
                 };
                 // This is normalised time so if normal time is already set ignore this param
                 if description.acquisition.scans[0].start_time == 0.0 {
