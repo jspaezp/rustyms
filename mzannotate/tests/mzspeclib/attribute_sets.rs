@@ -1,4 +1,14 @@
 //! Parser regressions for attribute-set inheritance, precedence, and group scope.
+//!
+//! mzSpecLib v1.0 specification (May 23, 2025), section 4.1.4, pp. 13-14,
+//! "Attribute set definitions": `all` applies implicitly; named sets apply via
+//! MS:1003212; later claims override earlier ones; entry values override sets.
+//! Repeated instances of a term are inherited and replaced together.
+//! https://github.com/HUPO-PSI/mzSpecLib/blob/506791706f41e95e0c2a1d4de15e49f25b59c760/specification/mzSpecLib_specification_v1.0.pdf#page=14
+//!
+//! Section 4.1.11, p. 21, specifies replacement rather than accumulation.
+//! Section 4.1.12 supplies worked examples: claim order (Example 1, pp. 21-23),
+//! repeated terms (Example 2, p. 23), and grouped claims (Example 3, pp. 23-24).
 use mzannotate::{
     mzspeclib::{Attribute, Attributes, MzSpecLibTextParser},
     spectrum::AnnotatedSpectrum,
@@ -30,6 +40,8 @@ fn action_values(attributes: &[Attribute]) -> Vec<String> {
 }
 
 fn interpretation_attributes(claims_and_attributes: &str) -> Attributes {
+    // Synthetic interpretation fixture exercising the type-independent rules in
+    // sections 4.1.4 and 4.1.12; not copied from an upstream interpretation example.
     // Declaration order deliberately differs from the claim order tested below.
     let text = format!(
         "<mzSpecLib>
@@ -54,6 +66,10 @@ MS:1000543|data processing action=named second
 
 #[test]
 fn spectrum_named_set_replaces_default_origin_in_description() {
+    // Reduced from the upstream SpectraST example: `all` supplies observed origin
+    // (line 29), DECOY supplies decoy origin (lines 35-36), and line 246 claims it.
+    // https://github.com/HUPO-PSI/mzSpecLib/blob/506791706f41e95e0c2a1d4de15e49f25b59c760/examples/SpectraST/fetal_brain_tiny_consensus_td.mzSpecLib.txt#L18-L36
+    // https://github.com/HUPO-PSI/mzSpecLib/blob/506791706f41e95e0c2a1d4de15e49f25b59c760/examples/SpectraST/fetal_brain_tiny_consensus_td.mzSpecLib.txt#L246
     let spectrum = parse_spectrum(
         "<mzSpecLib>
 MS:1003186|library format version=1.0
@@ -81,6 +97,8 @@ MS:1003212|library attribute set name=decoy
 
 #[test]
 fn interpretation_inherits_all_without_any_named_claim() {
+    // Section 4.1.4, pp. 13-14: the reserved `all` set applies to every entry
+    // of its type, without an explicit MS:1003212 claim.
     let attributes = interpretation_attributes("");
     assert_eq!(attributes.len(), 1, "only the ungrouped context is present");
     assert_eq!(
@@ -92,6 +110,8 @@ fn interpretation_inherits_all_without_any_named_claim() {
 
 #[test]
 fn named_set_replaces_every_default_value_and_preserves_its_repeats() {
+    // Section 4.1.11, p. 21: named instances supersede the instances in `all`
+    // together; multiple values within the winning context remain together.
     let attributes = interpretation_attributes("MS:1003212|library attribute set name=named");
     assert_eq!(
         action_values(&attributes[0]),
@@ -102,6 +122,8 @@ fn named_set_replaces_every_default_value_and_preserves_its_repeats() {
 
 #[test]
 fn last_claimed_set_wins_regardless_of_header_declaration_order() {
+    // Section 4.1.12, Example 1, pp. 22-23 explicitly distinguishes claim order
+    // from the order in which sets are defined in the library header.
     let attributes = interpretation_attributes(
         "MS:1003212|library attribute set name=named
 MS:1003212|library attribute set name=later",
@@ -115,6 +137,8 @@ MS:1003212|library attribute set name=later",
 
 #[test]
 fn entry_values_replace_every_inherited_value_and_preserve_its_repeats() {
+    // Section 4.1.11, p. 21, and section 4.1.12, Example 2, p. 23:
+    // local instances replace every inherited instance of the same term.
     let attributes = interpretation_attributes(
         "MS:1003212|library attribute set name=named
 MS:1000543|data processing action=entry first
@@ -129,6 +153,12 @@ MS:1000543|data processing action=entry second",
 
 #[test]
 fn grouped_claim_inherits_exact_value_only_inside_its_group() {
+    // Section 4.1.12, Example 3, pp. 23-24: claiming a set inside a group
+    // places its inherited attributes in that group.
+    // Adapted to Interpretation from the upstream ANALYTE example, whose
+    // HUMAN_TRYPTIC definition is at lines 30-35 and grouped claim at line 74.
+    // https://github.com/HUPO-PSI/mzSpecLib/blob/506791706f41e95e0c2a1d4de15e49f25b59c760/examples/SpectraST/fetal_brain_tiny.mzSpecLib.txt#L30-L35
+    // https://github.com/HUPO-PSI/mzSpecLib/blob/506791706f41e95e0c2a1d4de15e49f25b59c760/examples/SpectraST/fetal_brain_tiny.mzSpecLib.txt#L74-L77
     let spectrum = parse_spectrum(
         "<mzSpecLib>
 MS:1003186|library format version=1.0
