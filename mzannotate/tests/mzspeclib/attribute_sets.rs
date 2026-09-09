@@ -66,6 +66,10 @@ MS:1000543|data processing action=named second
 
 #[test]
 fn spectrum_named_set_replaces_default_origin_in_description() {
+    // Before: the named claim was missed, leaving only the default
+    // MS:1003073|observed spectrum in description.params.
+    // After: the claimed set overrides the default, leaving exactly one origin:
+    // MS:1003195|shuffle-and-reposition decoy spectrum.
     // Reduced from the upstream SpectraST example: `all` supplies observed origin
     // (line 29), DECOY supplies decoy origin (lines 35-36), and line 246 claims it.
     // https://github.com/HUPO-PSI/mzSpecLib/blob/506791706f41e95e0c2a1d4de15e49f25b59c760/examples/SpectraST/fetal_brain_tiny_consensus_td.mzSpecLib.txt#L18-L36
