@@ -12,6 +12,9 @@ use serde_json as _;
 use thin_vec as _;
 use uom as _;
 
+#[path = "mzspeclib/attribute_sets.rs"]
+mod attribute_sets;
+
 #[test]
 fn read_all_files() {
     let mut files = 0;
