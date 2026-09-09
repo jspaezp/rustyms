@@ -1,6 +1,7 @@
 //! Handle mzSpecLib files. For now only the text encoding is supported.
 mod analyte;
 mod attribute;
+mod attribute_set;
 mod header;
 mod interpretation;
 mod protein_description;
@@ -10,6 +11,7 @@ mod write;
 
 pub use analyte::*;
 pub use attribute::*;
+pub(crate) use attribute_set::*;
 pub use header::*;
 pub use interpretation::*;
 pub use protein_description::*;

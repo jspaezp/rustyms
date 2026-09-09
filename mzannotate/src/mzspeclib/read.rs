@@ -27,9 +27,10 @@ use crate::{
     fragment::Fragment,
     helper_functions::explain_number_error,
     mzspeclib::{
-        Analyte, AnalyteTarget, Attribute, AttributeParseError, AttributeSet, AttributeValue,
-        EntryType, Id, Interpretation, LibraryHeader, ProteinDescription, merge_attributes,
-        populate_spectrum_description_from_attributes, to_mzdata_cv,
+        Analyte, AnalyteTarget, Attribute, AttributeGroups, AttributeParseError, AttributeSet,
+        AttributeSets, AttributeValue, EntryType, Id, Interpretation, LibraryHeader,
+        ProteinDescription, flatten_attribute_groups,
+        populate_spectrum_description_from_attributes, resolve_attribute_sets, to_mzdata_cv,
     },
     spectrum::{AnnotatedPeak, AnnotatedSpectrum},
 };
@@ -102,10 +103,7 @@ impl ErrorKind for MzSpecLibErrorKind {
 pub struct MzSpecLibTextParser<'ontologies, Reader: Read> {
     inner: Reader,
     header: LibraryHeader,
-    header_attribute_sets_with_context: HashMap<
-        EntryType,
-        HashMap<String, HashMap<Option<u32>, Vec<(Attribute, Context<'static>)>>>,
-    >,
+    header_attribute_sets_with_context: HashMap<EntryType, AttributeSets>,
     state: ParserState,
     line_cache: VecDeque<String>,
     line_index: u32,
@@ -273,11 +271,7 @@ impl<'ontologies, R: BufRead> MzSpecLibTextParser<'ontologies, R> {
     /// # Errors
     /// When an attribute set is invalid or if the structure is invalid.
     fn read_attribute_sets(&mut self) -> Result<(), BoxedError<'static, MzSpecLibErrorKind>> {
-        type IntermediateAttributeSet = (
-            EntryType,
-            String,
-            HashMap<Option<u32>, Vec<(Attribute, Context<'static>)>>,
-        );
+        type IntermediateAttributeSet = (EntryType, String, AttributeGroups);
 
         fn store<R: Read>(
             current_attribute_set: Option<IntermediateAttributeSet>,
@@ -378,7 +372,7 @@ impl<'ontologies, R: BufRead> MzSpecLibTextParser<'ontologies, R> {
                                     };
                                     let set_id = id.to_string();
                                     current_attribute_set =
-                                        Some((set_entry_tp, set_id, HashMap::new()));
+                                        Some((set_entry_tp, set_id, AttributeGroups::new()));
                                 } else {
                                     return Err(BoxedError::new(
                                         MzSpecLibErrorKind::Declaration,
@@ -793,6 +787,7 @@ impl<'ontologies, R: BufRead> MzSpecLibTextParser<'ontologies, R> {
             attributes: vec![Vec::new(); 1],
             ..Default::default()
         };
+        let mut term_collection = AttributeGroups::new();
         loop {
             match self.read_attribute(&mut buf) {
                 Ok((group_id, attribute, range)) => {
@@ -823,14 +818,10 @@ impl<'ontologies, R: BufRead> MzSpecLibTextParser<'ontologies, R> {
                     {
                         // Ignore, can be calculated easily on the fly
                     } else {
-                        let index = group_id.map_or(0, |i| i as usize + 1);
-                        if interp.attributes.len() <= index {
-                            interp.attributes.extend(std::iter::repeat_n(
-                                Vec::new(),
-                                index - interp.attributes.len() + 1,
-                            ));
-                        }
-                        interp.attributes[index].push(attribute);
+                        term_collection.entry(group_id).or_default().push((
+                            attribute,
+                            self.current_context().lines(0, &buf).to_owned(),
+                        ));
                     }
                 }
                 Err(e) => {
@@ -854,24 +845,10 @@ impl<'ontologies, R: BufRead> MzSpecLibTextParser<'ontologies, R> {
             }
         }
 
-        let attr_sets: Vec<_> = interp.attributes[0]
-            .iter()
-            .filter(|a| a.name == term!(MS:1003212|library attribute set name))
-            .map(|v| v.value.to_string())
-            .collect();
-        for name in attr_sets {
-            for attr_set in self
-                .header
-                .attribute_classes
-                .get(&EntryType::Interpretation)
-                .into_iter()
-                .flatten()
-            {
-                if attr_set.id == name || attr_set.id == "all" {
-                    merge_attributes(&mut interp.attributes, &attr_set.attributes); // TODO: try to interpret the merged attributes as well.
-                }
-            }
-        }
+        interp.attributes = flatten_attribute_groups(&resolve_attribute_sets(
+            &term_collection,
+            self.header_attribute_sets_with_context.get(&EntryType::Interpretation),
+        ));
         let mut first = true;
         interp.attributes.retain(|v| {
             let retain = !v.is_empty() || first;
@@ -1034,8 +1011,7 @@ impl<'ontologies, R: BufRead> MzSpecLibTextParser<'ontologies, R> {
         spec.description.precursor.push(Precursor::default());
         spec.description.precursor[0].ions.push(SelectedIon::default());
 
-        let mut term_collection: HashMap<Option<u32>, Vec<(Attribute, Context<'static>)>> =
-            HashMap::new();
+        let mut term_collection = AttributeGroups::new();
 
         loop {
             match self.read_attribute(&mut buf) {
@@ -1067,29 +1043,15 @@ impl<'ontologies, R: BufRead> MzSpecLibTextParser<'ontologies, R> {
             }
         }
 
-        let set_names: Vec<_> = spec.attributes[0]
-            .iter()
-            .filter(|a| a.name == term!(MS:1003212|library attribute set name))
-            .map(|v| v.value.to_string())
-            .collect();
-
+        let attributes = resolve_attribute_sets(
+            &term_collection,
+            self.header_attribute_sets_with_context.get(&EntryType::Spectrum),
+        );
         populate_spectrum_description_from_attributes(
-            term_collection.iter(),
+            attributes.iter(),
             &mut spec.description,
             &mut spec.attributes,
         )?;
-        if let Some(sets) = self.header_attribute_sets_with_context.get(&EntryType::Spectrum) {
-            populate_spectrum_description_from_attributes(
-                sets.iter()
-                    .filter_map(|attr_set| {
-                        (set_names.contains(attr_set.0) || attr_set.0 == "all")
-                            .then_some(attr_set.1.iter())
-                    })
-                    .flatten(),
-                &mut spec.description,
-                &mut spec.attributes,
-            )?;
-        }
 
         spec.description.precursor[0].activation._extract_methods_from_params();
 
