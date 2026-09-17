@@ -126,3 +126,10 @@ The only canonicalized arrays are analyte proteins/parameters already produced i
 nondeterministic HashMap order. Snapshots are local ignored artifacts, not bundled
 test fixtures. No universal compatibility claim is made for inputs absent from the
 corpus; targeted tests cover new contracts and recovery/reuse behavior.
+
+## Aggregate workload benchmark
+
+On the supplied HeLa library (948,957 spectra), summing intensities and averaging
+reported fragment/selected-ion m/z by target/decoy took 6.217 s with reusable records
+versus 22.981 s with the legacy reader (median of three passes; decompression excluded).
+Counts and aggregates matched. See [benchmark source, methodology and results](mzspeclib-benchmark.md).
