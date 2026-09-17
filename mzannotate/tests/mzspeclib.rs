@@ -6,6 +6,8 @@ use context_error as _;
 use indexmap as _;
 use itertools as _;
 use mzannotate::mzspeclib::{MzSpecLibTextParser, MzSpecLibTextWriter};
+use mzdata as _;
+use num_traits as _;
 use ordered_float as _;
 use serde as _;
 use serde_json as _;
@@ -14,6 +16,9 @@ use uom as _;
 
 #[path = "mzspeclib/attribute_sets.rs"]
 mod attribute_sets;
+
+#[path = "mzspeclib/snapshots.rs"]
+mod snapshots;
 
 #[test]
 fn read_all_files() {
