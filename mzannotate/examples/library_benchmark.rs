@@ -7,7 +7,12 @@ use mzannotate::mzspeclib::{
 use mzcore::ontology::STATIC_ONTOLOGIES;
 use mzcv::curie;
 use mzdata::params::{ControlledVocabulary, ParamValue};
-use std::{error::Error, fs::File, io::BufReader, time::Instant};
+use std::{
+    error::Error,
+    fs::File,
+    io::{BufRead, BufReader},
+    time::Instant,
+};
 
 #[derive(Default, Debug)]
 struct Totals {
@@ -32,6 +37,7 @@ impl Totals {
 }
 // Fixture policy: predicted-only is target; explicit MS:1003195 is decoy.
 // Fail on missing/unknown origins instead of silently counting them as targets.
+#[allow(single_use_lifetimes)]
 fn classify<'a>(
     origins: impl Iterator<Item = std::borrow::Cow<'a, str>>,
 ) -> Result<usize, Box<dyn Error>> {
@@ -54,12 +60,21 @@ fn classify<'a>(
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().collect();
     let [_, mode, path] = args.as_slice() else {
-        return Err("usage: library_benchmark legacy|record PATH (decompressed text)".into());
+        return Err("usage: library_benchmark legacy|record PATH (.txt or .gz)".into());
     };
     // Force ontology initialization outside the measured region for both paths.
     std::hint::black_box(&*STATIC_ONTOLOGIES);
     let start = Instant::now();
-    let input = BufReader::with_capacity(256 * 1024, File::open(path)?);
+    let compressed = path.ends_with(".gz");
+    let file = BufReader::with_capacity(256 * 1024, File::open(path)?);
+    let input: Box<dyn BufRead> = if compressed {
+        Box::new(BufReader::with_capacity(
+            256 * 1024,
+            flate2::read::MultiGzDecoder::new(file),
+        ))
+    } else {
+        Box::new(file)
+    };
     let mut totals = [Totals::default(), Totals::default()];
     match mode.as_str() {
         "legacy" => {
@@ -130,7 +145,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => return Err("mode must be legacy or record".into()),
     }
     let elapsed = start.elapsed().as_secs_f64();
-    println!("mode={mode} seconds={elapsed:.6}");
+    println!("mode={mode} gzip={compressed} seconds={elapsed:.6}");
     for (label, t) in ["target", "decoy"].into_iter().zip(totals) {
         println!(
             "{label} spectra={} peaks={} intensity_sum={:.12} fragment_mz_mean={:.12} precursor_mz_mean={:.12}",

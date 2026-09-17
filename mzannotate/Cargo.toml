@@ -36,6 +36,7 @@ coloured-errors = ["context_error/colored"]
 isotopes = ["mzcore/isotopes"]
 
 [dev-dependencies]
+flate2 = { workspace = true }
 mzdata = { workspace = true, features = ["serde"] }
 
 [lints]

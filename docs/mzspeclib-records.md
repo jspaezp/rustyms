@@ -133,3 +133,7 @@ On the supplied HeLa library (948,957 spectra), summing intensities and averagin
 reported fragment/selected-ion m/z by target/decoy took 6.217 s with reusable records
 versus 22.981 s with the legacy reader (median of three passes; decompression excluded).
 Counts and aggregates matched. See [benchmark source, methodology and results](mzspeclib-benchmark.md).
+
+Direct gzip loading takes 8.956 s versus 25.241 s (same workload,
+three-pass medians). Actual main (`8524b24e`) takes 22.166 s but incorrectly
+places every spectrum in the target group; see the benchmark's separate main results.
