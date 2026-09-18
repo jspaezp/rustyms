@@ -130,11 +130,47 @@ impl MolecularFormula {
         value: &'a str,
         range: impl RangeBounds<usize>,
     ) -> Result<Self, BoxedError<'a, BasicKind>> {
+        let mut result = Self::default();
+        Self::pro_forma_fill::<ALLOW_CHARGE, ALLOW_EMPTY>(&mut result, base_context, value, range)?;
+        Ok(result)
+    }
+
+    /// Parse into existing formula storage. Successful parses retain capacity;
+    /// errors use the same contextual diagnostics as [`Self::pro_forma`].
+    /// # Errors
+    /// Returns the ordinary ProForma formula error for invalid input.
+    pub fn pro_forma_into<'a, const ALLOW_CHARGE: bool, const ALLOW_EMPTY: bool>(
+        &mut self,
+        value: &'a str,
+    ) -> Result<(), BoxedError<'a, BasicKind>> {
+        match Self::pro_forma_fill::<ALLOW_CHARGE, ALLOW_EMPTY>(
+            self,
+            &Context::default(),
+            value,
+            0..value.len(),
+        ) {
+            Ok(()) => Ok(()),
+            Err(_) => Self::pro_forma_fill::<ALLOW_CHARGE, ALLOW_EMPTY>(
+                self,
+                &Context::default().lines(0, value),
+                value,
+                0..value.len(),
+            ),
+        }
+    }
+
+    fn pro_forma_fill<'a, const ALLOW_CHARGE: bool, const ALLOW_EMPTY: bool>(
+        result: &mut Self,
+        base_context: &Context<'a>,
+        value: &'a str,
+        range: impl RangeBounds<usize>,
+    ) -> Result<(), BoxedError<'a, BasicKind>> {
+        result.clear();
         let mut index = range.start_index();
         let end = range.end_index_exclusive(value.len());
         if (index..end).is_empty() || index >= end || &value[index..end] == "(empty)" {
             return if ALLOW_EMPTY {
-                Ok(Self::default())
+                Ok(())
             } else {
                 Err(BoxedError::new(
                     BasicKind::Error,
@@ -147,7 +183,6 @@ impl MolecularFormula {
 
         let mut element = None;
         let bytes = value.as_bytes();
-        let mut result = Self::default();
         'main_parse_loop: while index < end {
             match (bytes[index], element) {
                 (b'[', _) => {
@@ -212,9 +247,7 @@ impl MolecularFormula {
                                 )
                             })?;
 
-                        if let Err(err) =
-                            Self::add(&mut result, (parsed_element, Some(isotope), num))
-                        {
+                        if let Err(err) = Self::add(result, (parsed_element, Some(isotope), num)) {
                             return Err(BoxedError::new(
                                 BasicKind::Error,
                                 "Invalid ProForma molecular formula",
@@ -249,7 +282,7 @@ impl MolecularFormula {
                     })?;
 
                     if num != 0
-                        && let Err(err) = Self::add(&mut result, (ele, None, num))
+                        && let Err(err) = Self::add(result, (ele, None, num))
                     {
                         return Err(BoxedError::new(
                             BasicKind::Error,
@@ -297,7 +330,7 @@ impl MolecularFormula {
                 }
                 _ => {
                     if let Some(element) = element
-                        && let Err(err) = Self::add(&mut result, (element, None, 1))
+                        && let Err(err) = Self::add(result, (element, None, 1))
                     {
                         return Err(BoxedError::new(
                             BasicKind::Error,
@@ -310,7 +343,9 @@ impl MolecularFormula {
                             )),
                         ));
                     }
-                    let element_text: String = value[index..].chars().take(2).collect::<String>();
+                    let tail = &value[index..];
+                    let element_text =
+                        &tail[..tail.char_indices().nth(2).map_or(tail.len(), |(i, _)| i)];
                     for possible in ELEMENT_PARSE_LIST {
                         if element_text.starts_with(possible.0) {
                             element = Some(possible.1);
@@ -332,7 +367,7 @@ impl MolecularFormula {
             }
         }
         if let Some(element) = element
-            && let Err(err) = Self::add(&mut result, (element, None, 1))
+            && let Err(err) = Self::add(result, (element, None, 1))
         {
             return Err(BoxedError::new(
                 BasicKind::Error,
@@ -355,7 +390,7 @@ impl MolecularFormula {
                 base_context.clone().add_highlight((0, range)),
             ))
         } else {
-            Ok(result)
+            Ok(())
         }
     }
 }
@@ -368,4 +403,28 @@ fn fuzz() {
     let _a = MolecularFormula::pro_forma::<true, true>("+Wv:z-,33U");
     assert!(MolecularFormula::pro_forma::<true, false>("").is_err());
     assert!(MolecularFormula::pro_forma::<true, false>("f{}").is_err());
+}
+
+#[test]
+fn parse_into_reuses_and_preserves_formula_errors() {
+    let mut formula = MolecularFormula::default();
+    for text in [
+        "C12H20O2",
+        "H",
+        "[13C2][12C-2]H2N",
+        "",
+        "???",
+        "C6H12O6",
+        "N1H4:z+1",
+    ] {
+        let expected = MolecularFormula::pro_forma::<true, false>(text);
+        let observed = formula.pro_forma_into::<true, false>(text);
+        match (expected, observed) {
+            (Ok(expected), Ok(())) => assert_eq!(formula, expected),
+            (Err(expected), Err(observed)) => {
+                assert_eq!(format!("{expected:?}"), format!("{observed:?}"))
+            }
+            (expected, observed) => panic!("{text}: {expected:?} != {observed:?}"),
+        }
+    }
 }

@@ -34,8 +34,12 @@ Views contain references and ranges. They can outlive temporary collection views
 but Rust prevents replacing a record while its views are still used. Records are
 `Send` but not `Sync`: each worker owns its record, whose lazy caches use safe
 `OnceCell`/`RefCell` storage. The borrowed header/context is immutable and `Sync`. Raw peak text is still
-read and buffered during metadata-only traversal. Molecular objects, owned exports,
-and error construction can allocate; this is not a zero-allocation chemistry parser.
+read and buffered during metadata-only traversal. Decoded analyte/interpretation
+slots retain nested storage across refills, smaller scopes, target-kind changes and
+failed chemistry. Common linear chemistry and formula accumulation reuse storage
+after warm-up. Complex chemistry, fragment resolution, owned exports, diagnostics
+and newly encountered larger shapes can still allocate; this is not a universal
+zero-allocation guarantee.
 
 ## Consumer-owned early rejection
 
@@ -74,6 +78,7 @@ now succeeds even when unrequested numeric peaks or ProForma would fail.
 | Units and custom pairing | `occurrence.group()`, `custom_values()`; inspect ambiguity |
 | All analyte metadata without chemistry | `analyte_scopes()` |
 | Interpreted chemistry | `analytes()`; original scope evidence remains available |
+| Borrowed calculated formulas | `analyte.formulas()`; cached alternatives, no implicit first choice |
 | Explicit field presence | `SuppliedField::Absent` versus `Present("")` / `Present("?")` |
 | Peak provenance | `source_row()`, `source_position()`, aggregation and extra columns |
 | Every annotation alternative | `resolved_annotations()?.iter()`, each row's `iter()` |
@@ -158,3 +163,46 @@ or emitting partial counts as successful results.
 
 See [chemistry benchmark methodology and results](mzspeclib-chemistry-benchmark.md)
 for serial/parallel amino-acid and carbon counting on the supplied HeLa library.
+
+## Chemistry reuse and owned export
+
+`DecodedAnalyte` contains an ID and decoded target, with private reusable chemistry
+and formula buffers. It is no longer an alias for the owned legacy `Analyte`.
+Protein/custom properties stay in `analyte_scopes().attributes()`; chemistry access
+does not stringify and reparse those properties. Likewise, decoded interpretations
+contain IDs, probability and reusable analyte-reference arrays; their other
+properties stay in interpretation scope views. `materialize()`/`into_annotated()`
+explicitly create the owned legacy protein/parameter/attribute structures.
+
+```rust
+for analyte in record.analytes()?.iter() {
+    // Same cached slice on repeated access; all alternatives remain available.
+    for formula in analyte.formulas().iter() {
+        inspect_elements(analyte.id, formula.elements());
+    }
+}
+```
+
+`analyte.target.formulas()` remains the old allocating chemistry trait method.
+Use **`analyte.formulas()`** for the record's reusable, cached calculation. Unknown
+targets return an empty formula slice, reported molecular formulas return one, and
+ambiguous chemistry retains every alternative. Declared formula text remains
+available through scope attributes, separately from calculated formulas.
+
+The reusable ProForma decoder handles uppercase linear residues with numeric
+`UNIMOD:`/`MOD:` side-chain modifications and optional nonzero integer proton
+charge. It uses the existing ontology and placement predicates. Named ions,
+terminal modifications, global isotope syntax, glycans, cross-links, ambiguity,
+complex adducts and diagnostic-producing inputs go through the full parser;
+those paths retain semantics but may allocate. No unsupported syntax is silently
+simplified. Formula accumulation avoids intermediates for unambiguous linear
+chemistry with formula/database modifications; general cases use the existing
+resolver. Fragment-annotation chemistry has not acquired this zero-allocation
+common path.
+
+The warmed allocation tests include modified peptides, metadata/peak views,
+interpretation references, changing scope counts, peptide/formula/unknown target
+transitions, and successful chemistry after an error. They check allocation,
+reallocation **and free** calls; owned diagnostic disposal is outside the
+post-error decoding measurement. See the [chemistry benchmark](mzspeclib-chemistry-benchmark.md)
+for full-file measurements and limits.

@@ -561,6 +561,21 @@ impl<Complexity> Peptidoform<Complexity> {
         }
     }
 
+    pub(super) fn prepare_linear_reuse(&mut self) {
+        self.name.clear();
+        self.global.clear();
+        self.labile.clear();
+        self.n_term.clear();
+        self.c_term.clear();
+        self.modifications_of_unknown_position.clear();
+    }
+    pub(super) fn take_charge_for_reuse(&mut self) -> Option<MolecularCharge> {
+        self.charge_carriers.take()
+    }
+    pub(super) fn restore_charge_for_reuse(&mut self, charge: Option<MolecularCharge>) {
+        self.charge_carriers = charge;
+    }
+
     /// Set the charge carriers, use [`Self::charge_carriers`] unless absolutely necessary.
     pub(super) fn set_charge_carriers(&mut self, charge_carriers: Option<MolecularCharge>) {
         self.charge_carriers = charge_carriers;
@@ -1045,6 +1060,75 @@ impl<Complexity> Peptidoform<Complexity> {
         formulas
             .with_global_isotope_modifications(&self.global)
             .expect("Invalid global isotope modification in bare_formulas")
+    }
+
+    pub(super) fn formula_into_reuse(&self, out: &mut crate::chemistry::MolecularFormula) -> bool {
+        use crate::chemistry::{MolecularFormula, OutputMolecularFormula};
+        use crate::sequence::IsAminoAcid;
+        static RESIDUES: std::sync::LazyLock<[Option<MolecularFormula>; 26]> =
+            std::sync::LazyLock::new(|| {
+                std::array::from_fn(|index| {
+                    crate::sequence::AminoAcid::try_from(b'A' + index as u8)
+                        .ok()
+                        .and_then(|aa| {
+                            aa.calculate_masses_inner::<OutputMolecularFormula>(
+                                SequencePosition::Index(0, 1),
+                                0,
+                                0,
+                            )
+                            .single()
+                        })
+                })
+            });
+        if !self.global.is_empty() || !self.modifications_of_unknown_position.is_empty() {
+            return false;
+        }
+        out.clear();
+        // The existing whole-ion formula includes terminal water, but excludes
+        // charge carriers and labile modifications. Preserve that convention.
+        out.add((Element::H, None, 2)).unwrap();
+        out.add((Element::O, None, 1)).unwrap();
+        fn add_mod(out: &mut MolecularFormula, modification: &Modification) -> bool {
+            let Modification::Simple(modification) = modification else {
+                return false;
+            };
+            match modification.as_ref() {
+                SimpleModificationInner::Formula(formula)
+                | SimpleModificationInner::Database { formula, .. } => {
+                    *out += formula;
+                    true
+                }
+                SimpleModificationInner::Info(_) => true,
+
+                _ => false,
+            }
+        }
+        for modification in self.n_term.iter().chain(self.c_term.iter()) {
+            if !add_mod(out, modification) {
+                return false;
+            }
+        }
+        for residue in &self.sequence {
+            if residue.ambiguous.is_some() {
+                return false;
+            }
+            let Some(code) = residue.aminoacid.one_letter_code() else {
+                return false;
+            };
+            if !code.is_ascii_uppercase() {
+                return false;
+            }
+            let Some(formula) = &RESIDUES[code as usize - 'A' as usize] else {
+                return false;
+            };
+            *out += formula;
+            for modification in &residue.modifications {
+                if !add_mod(out, modification) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Gives the formulas for the whole peptide. With the global isotope modifications applied.

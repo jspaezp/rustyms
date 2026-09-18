@@ -295,6 +295,13 @@ impl MolecularFormula {
         self
     }
 
+    /// Clear the formula while retaining element and label storage for reuse.
+    pub fn clear(&mut self) {
+        self.elements.clear();
+        self.labels.clear();
+        self.additional_mass = OrderedFloat(0.0);
+    }
+
     /// Get an empty molecular formula with only a mass of unspecified origin
     #[must_use]
     pub fn with_additional_mass(additional_mass: f64) -> Self {

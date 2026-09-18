@@ -45,30 +45,29 @@ impl Counts {
     fn analytes(&mut self, analytes: &[Analyte]) -> WorkResult<()> {
         self.spectra += 1;
         for analyte in analytes {
-            let AnalyteTarget::PeptidoformIon(ion) = &analyte.target else {
-                return Err("benchmark requires peptidoform analytes".into());
-            };
-            self.analytes += 1;
-            for peptide in ion.peptidoforms() {
-                for residue in peptide.sequence() {
-                    let code = residue.aminoacid.one_letter_code().ok_or("missing residue code")?;
-                    if !code.is_ascii_uppercase() {
-                        return Err("noncanonical residue code".into());
-                    }
-                    self.residues[code as usize - 'A' as usize] += 1;
+            let target = &analyte.target;
+            let formula = target.formulas().single().ok_or("expected one molecular formula")?;
+            self.analyte(target, &formula)?;
+        }
+        Ok(())
+    }
+    fn analyte(&mut self, target: &AnalyteTarget, formula: &MolecularFormula) -> WorkResult<()> {
+        let AnalyteTarget::PeptidoformIon(ion) = target else {
+            return Err("benchmark requires peptidoform analytes".into());
+        };
+        self.analytes += 1;
+        for peptide in ion.peptidoforms() {
+            for residue in peptide.sequence() {
+                let code = residue.aminoacid.one_letter_code().ok_or("missing residue code")?;
+                if !code.is_ascii_uppercase() {
+                    return Err("noncanonical residue code".into());
                 }
+                self.residues[code as usize - 'A' as usize] += 1;
             }
-            // Decode chemistry, including modifications and isotope-specific carbon.
-            // Refuse ambiguity rather than silently selecting one candidate formula.
-            let formula = analyte
-                .target
-                .formulas()
-                .single()
-                .ok_or("expected one molecular formula")?;
-            for (element, _, count) in formula.elements() {
-                if *element == Element::C {
-                    self.carbon += u64::try_from(*count).map_err(|_| "negative carbon count")?;
-                }
+        }
+        for (element, _, count) in formula.elements() {
+            if *element == Element::C {
+                self.carbon += u64::try_from(*count).map_err(|_| "negative carbon count")?;
             }
         }
         Ok(())
@@ -98,7 +97,15 @@ fn record_counts(record: &SpectrumRecord<'_>, counts: &mut [Counts; 2]) -> WorkR
     if !predicted && !decoy {
         return Err("missing origin".into());
     }
-    counts[usize::from(decoy)].analytes(record.analytes().map_err(|e| e.to_string())?)
+    let counts = &mut counts[usize::from(decoy)];
+    counts.spectra += 1;
+    for analyte in record.analytes().map_err(|e| e.to_string())? {
+        let [formula] = analyte.formulas() else {
+            return Err("expected one molecular formula".into());
+        };
+        counts.analyte(&analyte.target, formula)?;
+    }
+    Ok(())
 }
 struct Batch<'a> {
     records: Vec<SpectrumRecord<'a>>,
@@ -378,7 +385,7 @@ mod tests {
 
     #[cfg(feature = "allocation-counting")]
     #[test]
-    fn warmed_record_property_and_peak_views_do_not_allocate() {
+    fn warmed_record_views_chemistry_and_formulas_do_not_allocate() {
         let (header, spectrum) = LIBRARY.split_once("<Spectrum=1>").unwrap();
         let input = format!("{header}{}", format!("<Spectrum=1>{spectrum}").repeat(101));
         let mut library =
@@ -390,6 +397,9 @@ mod tests {
                 for attribute in scope.attributes().unwrap().iter() {
                     std::hint::black_box(attribute.value().unwrap());
                 }
+            }
+            for analyte in record.analytes().unwrap() {
+                std::hint::black_box(analyte.formulas());
             }
             for peak in record.peaks().unwrap().iter() {
                 std::hint::black_box((peak.mz(), peak.intensity(), peak.annotation_field()));
@@ -409,6 +419,69 @@ mod tests {
             [0, 0, 0],
             "allocations, frees, reallocations after warm-up"
         );
+    }
+
+    #[cfg(feature = "allocation-counting")]
+    #[test]
+    fn warmed_reuse_survives_shorter_scopes_and_target_variant_changes() {
+        let header = "<mzSpecLib>\n";
+        let cases = [
+            "<Spectrum=1>\n<Analyte=1>\nMS:1003270|proforma peptidoform ion notation=M[UNIMOD:35]M[UNIMOD:35]M[UNIMOD:35]/2\n<Analyte=2>\nMS:1000866|molecular formula=C12H20O2\n<Interpretation=1>\nMS:1003163|analyte mixture members=1,2\n<Peaks>\n100\t1\t?\n",
+            "<Spectrum=2>\n<Analyte=1>\nMS:1000866|molecular formula=C6H12O6\n<Interpretation=1>\nMS:1003163|analyte mixture members=1\n<Peaks>\n101\t2\t?\n",
+            "<Spectrum=3>\n<Analyte=1>\n<Peaks>\n102\t3\t?\n",
+            "<Spectrum=4>\n<Analyte=1>\nMS:1003270|proforma peptidoform ion notation=A\n<Peaks>\n103\t4\t?\n",
+        ];
+        let input = format!("{header}{}", cases.concat().repeat(12));
+        let mut library =
+            MzSpecLibLibrary::open(input.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
+        let mut reader = library.reader();
+        let mut record = reader.empty_record();
+        let inspect = |record: &SpectrumRecord<'_>| {
+            for scope in record.scopes() {
+                for a in scope.attributes().unwrap().iter() {
+                    std::hint::black_box(a.value().unwrap());
+                }
+            }
+            for a in record.analytes().unwrap() {
+                std::hint::black_box(a.formulas());
+            }
+            std::hint::black_box(record.interpretations().unwrap());
+            std::hint::black_box(record.peaks().unwrap());
+        };
+        for _ in 0..8 {
+            assert!(reader.read_into(&mut record).unwrap());
+            inspect(&record);
+        }
+        let counts = allocation_counting::measure_thread(|| {
+            while reader.read_into(&mut record).unwrap() {
+                inspect(&record);
+            }
+        });
+        assert_eq!(counts, [0, 0, 0]);
+    }
+
+    #[cfg(feature = "allocation-counting")]
+    #[test]
+    fn chemistry_error_keeps_storage_for_the_next_valid_record() {
+        let (header, spectrum) = LIBRARY.split_once("<Spectrum=1>").unwrap();
+        let invalid = spectrum.replace("AC[UNIMOD:4]M[UNIMOD:35]/2", "???");
+        let input = format!("{header}<Spectrum=1>{spectrum}<Spectrum=2>{invalid}<Spectrum=3>{spectrum}");
+        let mut library = MzSpecLibLibrary::open(input.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
+        let mut reader = library.reader();
+        let mut record = reader.empty_record();
+        let mut totals = [Counts::default(), Counts::default()];
+        assert!(reader.read_into(&mut record).unwrap());
+        record_counts(&record, &mut totals).unwrap();
+        assert!(reader.read_into(&mut record).unwrap());
+        assert!(record.analytes().is_err());
+        // Clearing the previous owned error may free diagnostic storage. Decode
+        // the next valid record without allocating replacement chemistry buffers.
+        assert!(reader.read_into(&mut record).unwrap());
+        let counts = allocation_counting::measure_thread(|| {
+            record_counts(&record, &mut totals).unwrap();
+        });
+        assert_eq!(counts, [0, 0, 0]);
+        assert_eq!(totals[0].carbon, 26);
     }
 
     #[test]

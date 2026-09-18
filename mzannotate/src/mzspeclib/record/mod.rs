@@ -456,8 +456,8 @@ pub struct SpectrumRecord<'a> {
     generation: u64,
     loaded: bool,
     metadata: Vec<Reusable<metadata::ResolvedScope>>,
-    analytes: Reusable<Vec<DecodedAnalyte>>,
-    interpretations: Reusable<Vec<DecodedInterpretation>>,
+    analytes: Reusable<DecodedAnalytes>,
+    interpretations: Reusable<DecodedInterpretations>,
     peaks: Reusable<DecodedPeaks>,
     annotations: Reusable<AnnotationStorage>,
 }

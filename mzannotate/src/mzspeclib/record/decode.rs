@@ -19,8 +19,129 @@ use mzdata::{
     spectrum::{Precursor, ScanEvent, ScanWindow, SelectedIon},
 };
 
-pub type DecodedAnalyte = Analyte;
-pub type DecodedInterpretation = Interpretation;
+/// Decoded analyte chemistry. Supplied protein and custom properties remain
+/// borrowed through the corresponding analyte scope; owned export is explicit.
+pub struct DecodedAnalyte {
+    pub id: std::num::NonZeroU32,
+    pub target: AnalyteTarget,
+    scratch: mzcore::sequence::ProFormaScratch,
+    formulas: Reusable<mzcore::sequence::FormulaBuffer>,
+    spare_ion: PeptidoformIon,
+    spare_formula: MolecularFormula,
+}
+impl std::fmt::Debug for DecodedAnalyte {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodedAnalyte")
+            .field("id", &self.id)
+            .field("target", &self.target)
+            .finish()
+    }
+}
+impl Clear for mzcore::sequence::FormulaBuffer {
+    fn clear_reuse(&mut self) {
+        self.clear();
+    }
+}
+#[derive(Clone, Copy)]
+enum TargetKind {
+    Unknown,
+    Peptidoform,
+    Formula,
+}
+impl DecodedAnalyte {
+    fn select_target(&mut self, kind: TargetKind) {
+        if matches!(
+            (&self.target, kind),
+            (AnalyteTarget::PeptidoformIon(_), TargetKind::Peptidoform)
+                | (AnalyteTarget::MolecularFormula(_), TargetKind::Formula)
+        ) {
+            return;
+        }
+        match std::mem::take(&mut self.target) {
+            AnalyteTarget::PeptidoformIon(ion) => self.spare_ion = ion,
+            AnalyteTarget::MolecularFormula(formula) => self.spare_formula = formula,
+            AnalyteTarget::Unknown(_) => (),
+        }
+        self.target = match kind {
+            TargetKind::Peptidoform => {
+                AnalyteTarget::PeptidoformIon(std::mem::take(&mut self.spare_ion))
+            }
+            TargetKind::Formula => {
+                AnalyteTarget::MolecularFormula(std::mem::take(&mut self.spare_formula))
+            }
+            TargetKind::Unknown => AnalyteTarget::Unknown(None),
+        };
+    }
+
+    /// Calculate and borrow all formula alternatives using retained output buffers.
+    /// General/ambiguous chemistry may still allocate inside the resolver.
+    pub fn formulas(&self) -> &[MolecularFormula] {
+        self.formulas
+            .get(|out| {
+                match &self.target {
+                    AnalyteTarget::PeptidoformIon(ion) => {
+                        out.calculate(ion);
+                    }
+                    AnalyteTarget::MolecularFormula(formula) => out.set_formula(formula),
+                    AnalyteTarget::Unknown(_) => out.clear(),
+                }
+                Ok(())
+            })
+            .expect("formula cache initialization is infallible")
+            .as_slice()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct DecodedAnalytes {
+    slots: Vec<DecodedAnalyte>,
+    active: usize,
+}
+impl Clear for DecodedAnalytes {
+    fn clear_reuse(&mut self) {
+        self.active = 0;
+        for slot in &mut self.slots {
+            slot.formulas.reset();
+        }
+    }
+}
+impl DecodedAnalytes {
+    fn as_slice(&self) -> &[DecodedAnalyte] {
+        &self.slots[..self.active]
+    }
+    fn into_active(mut self) -> impl Iterator<Item = DecodedAnalyte> {
+        self.slots.truncate(self.active);
+        self.slots.into_iter()
+    }
+}
+
+/// Decoded interpretation links. Other properties remain in borrowed scope views.
+#[derive(Debug, Default)]
+pub struct DecodedInterpretation {
+    pub id: u32,
+    pub probability: Option<f64>,
+    pub analyte_refs: Vec<u32>,
+    scope_index: usize,
+}
+#[derive(Debug, Default)]
+pub(super) struct DecodedInterpretations {
+    slots: Vec<DecodedInterpretation>,
+    active: usize,
+}
+impl Clear for DecodedInterpretations {
+    fn clear_reuse(&mut self) {
+        self.active = 0;
+    }
+}
+impl DecodedInterpretations {
+    fn as_slice(&self) -> &[DecodedInterpretation] {
+        &self.slots[..self.active]
+    }
+    fn into_active(mut self) -> impl Iterator<Item = DecodedInterpretation> {
+        self.slots.truncate(self.active);
+        self.slots.into_iter()
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct DecodedPeaks {
@@ -287,7 +408,7 @@ impl SpectrumRecord<'_> {
                     let ScopeId::Analyte(id) = scope.id() else {
                         unreachable!()
                     };
-                    if out.iter().any(|a| a.id.get() == id) {
+                    if out.as_slice().iter().any(|a| a.id.get() == id) {
                         return Err(self.error(
                             RecordErrorKind::Conflict,
                             "duplicate analyte ID",
@@ -295,34 +416,48 @@ impl SpectrumRecord<'_> {
                         ));
                     }
                     let attrs = scope.attributes()?;
-                    let target = if let Some(a) = singleton(attrs, curie!(MS:1003270))? {
-                        AnalyteTarget::PeptidoformIon(
-                            PeptidoformIon::pro_forma(a.raw_value(), self.context.ontologies)
-                                .map_err(|e| {
-                                    self.error(
-                                        RecordErrorKind::Malformed,
-                                        format!("invalid ProForma: {e:?}"),
-                                        a.origin().position,
-                                    )
-                                })?
-                                .0,
-                        )
+                    if out.active == out.slots.len() {
+                        out.slots.push(DecodedAnalyte {
+                            id: std::num::NonZeroU32::new(id).unwrap(),
+                            target: AnalyteTarget::default(),
+                            scratch: mzcore::sequence::ProFormaScratch::default(),
+                            formulas: Reusable::default(),
+                            spare_ion: PeptidoformIon::default(),
+                            spare_formula: MolecularFormula::default(),
+                        });
+                    }
+                    let analyte = &mut out.slots[out.active];
+                    analyte.id = std::num::NonZeroU32::new(id).unwrap();
+                    if let Some(a) = singleton(attrs, curie!(MS:1003270))? {
+                        analyte.select_target(TargetKind::Peptidoform);
+                        let AnalyteTarget::PeptidoformIon(ion) = &mut analyte.target else {
+                            unreachable!()
+                        };
+                        analyte
+                            .scratch
+                            .parse_into(ion, a.raw_value(), self.context.ontologies)
+                            .map_err(|e| {
+                                self.error(
+                                    RecordErrorKind::Malformed,
+                                    format!("invalid ProForma: {e:?}"),
+                                    a.origin().position,
+                                )
+                            })?;
                     } else if let Some(a) = singleton(attrs, curie!(MS:1000866))? {
-                        AnalyteTarget::MolecularFormula(
-                            MolecularFormula::pro_forma::<false, false>(a.raw_value()).map_err(
-                                |e| {
-                                    self.error(
-                                        RecordErrorKind::Malformed,
-                                        e.to_string(),
-                                        a.origin().position,
-                                    )
-                                },
-                            )?,
-                        )
+                        analyte.select_target(TargetKind::Formula);
+                        let AnalyteTarget::MolecularFormula(formula) = &mut analyte.target else {
+                            unreachable!()
+                        };
+                        formula.pro_forma_into::<false, false>(a.raw_value()).map_err(|e| {
+                            self.error(
+                                RecordErrorKind::Malformed,
+                                e.to_string(),
+                                a.origin().position,
+                            )
+                        })?;
                     } else {
-                        AnalyteTarget::Unknown(None)
-                    };
-                    let mut analyte = Analyte::new(std::num::NonZeroU32::new(id).unwrap(), target);
+                        analyte.select_target(TargetKind::Unknown);
+                    }
                     if let Some(charge) = singleton(attrs, curie!(MS:1000041))? {
                         let value = charge.raw_value().parse::<isize>().map_err(|_| {
                             self.error(
@@ -331,48 +466,42 @@ impl SpectrumRecord<'_> {
                                 charge.origin().position,
                             )
                         })?;
-                        analyte.target.set_charge(Charge::new::<mzcore::system::e>(value));
-                    }
-                    let owned = owned_groups(attrs)?;
-                    for group in owned.values() {
-                        let mut protein = ProteinDescription::default();
-                        for (a, context) in group {
-                            if !protein.populate_from_attribute(a, context).map_err(|e| {
-                                self.error(RecordErrorKind::Malformed, e.to_string(), self.origin)
-                            })? {
-                                if ![curie!(MS:1003270), curie!(MS:1000866), curie!(MS:1000041)]
-                                    .contains(&a.name.accession)
-                                {
-                                    analyte.params.push(a.clone().into());
-                                }
-                            }
-                        }
-                        if !protein.is_empty() {
-                            analyte.proteins.push(protein);
+                        let charge = Charge::new::<mzcore::system::e>(value);
+                        if let AnalyteTarget::PeptidoformIon(ion) = &mut analyte.target {
+                            analyte.scratch.set_charge(ion, charge);
+                        } else {
+                            analyte.target.set_charge(charge);
                         }
                     }
-                    out.push(analyte);
+                    out.active += 1;
                 }
                 Ok(())
             })
-            .map(Vec::as_slice)
+            .map(DecodedAnalytes::as_slice)
     }
 
     pub fn interpretations(&self) -> Result<&[DecodedInterpretation], RecordError> {
         self.require()?;
         self.interpretations
             .get(|out| {
-                for scope in self.interpretation_scopes() {
+                for (scope_index, scope) in self.interpretation_scopes().enumerate() {
                     let ScopeId::Interpretation(id) = scope.id() else {
                         unreachable!()
                     };
                     let attrs = scope.attributes()?;
                     let probability =
                         singleton(attrs, curie!(MS:1002357))?.map(|a| a.to_f64()).transpose()?;
-                    let mut analyte_refs = Vec::new();
+                    if out.active == out.slots.len() {
+                        out.slots.push(DecodedInterpretation::default());
+                    }
+                    let interpretation = &mut out.slots[out.active];
+                    interpretation.id = id;
+                    interpretation.scope_index = scope_index;
+                    interpretation.probability = probability;
+                    interpretation.analyte_refs.clear();
                     for a in attrs.by_accession(curie!(MS:1003163)) {
                         for id in a.raw_value().split(',') {
-                            analyte_refs.push(id.trim().parse().map_err(|_| {
+                            interpretation.analyte_refs.push(id.trim().parse().map_err(|_| {
                                 self.error(
                                     RecordErrorKind::Malformed,
                                     "invalid analyte reference",
@@ -381,17 +510,11 @@ impl SpectrumRecord<'_> {
                             })?);
                         }
                     }
-                    out.push(Interpretation {
-                        id,
-                        probability,
-                        analyte_refs,
-                        attributes: flatten(owned_groups(attrs)?),
-                        ..Interpretation::default()
-                    });
+                    out.active += 1;
                 }
                 Ok(())
             })
-            .map(Vec::as_slice)
+            .map(DecodedInterpretations::as_slice)
     }
 
     pub fn resolved_annotations(&self) -> Result<AnnotationReportView<'_>, RecordError> {
@@ -473,6 +596,9 @@ impl SpectrumRecord<'_> {
     pub fn validate(&self) -> Result<(), RecordError> {
         self.validate_sections()?;
         self.project_description()?;
+        for analyte in self.analytes()? {
+            self.project_analyte(analyte.id, AnalyteTarget::default())?;
+        }
         Ok(())
     }
     fn validate_sections(&self) -> Result<(), RecordError> {
@@ -516,8 +642,23 @@ impl SpectrumRecord<'_> {
     pub fn materialize(&self) -> Result<AnnotatedSpectrum<OutputMolecularFormula>, RecordError> {
         self.validate_sections()?;
         let mut spec = self.project_description()?;
-        spec.analytes = self.analytes()?.to_vec();
-        spec.interpretations = self.interpretations()?.to_vec();
+        spec.analytes = self
+            .analytes()?
+            .iter()
+            .map(|a| self.project_analyte(a.id, a.target.clone()))
+            .collect::<Result<_, _>>()?;
+        spec.interpretations = self
+            .interpretations()?
+            .iter()
+            .map(|i| {
+                self.project_interpretation(
+                    i.scope_index,
+                    i.id,
+                    i.probability,
+                    i.analyte_refs.clone(),
+                )
+            })
+            .collect::<Result<_, _>>()?;
         let report = self.resolved_annotations()?;
         for peak in report.peaks.iter() {
             let annotations = report
@@ -539,6 +680,53 @@ impl SpectrumRecord<'_> {
             ));
         }
         Ok(spec)
+    }
+    fn project_interpretation(
+        &self,
+        scope_index: usize,
+        id: u32,
+        probability: Option<f64>,
+        analyte_refs: Vec<u32>,
+    ) -> Result<Interpretation, RecordError> {
+        let scope = self.interpretation_scopes().nth(scope_index).unwrap();
+        Ok(Interpretation {
+            id,
+            probability,
+            analyte_refs,
+            attributes: flatten(owned_groups(scope.attributes()?)?),
+            ..Interpretation::default()
+        })
+    }
+    fn project_analyte(
+        &self,
+        id: std::num::NonZeroU32,
+        target: AnalyteTarget,
+    ) -> Result<Analyte, RecordError> {
+        let scope = self
+            .analyte_scopes()
+            .find(|scope| scope.id() == ScopeId::Analyte(id.get()))
+            .unwrap();
+        let attrs = scope.attributes()?;
+        let mut analyte = Analyte::new(id, target);
+        let owned = owned_groups(attrs)?;
+        for group in owned.values() {
+            let mut protein = ProteinDescription::default();
+            for (a, context) in group {
+                if !protein.populate_from_attribute(a, context).map_err(|e| {
+                    self.error(RecordErrorKind::Malformed, e.to_string(), self.origin)
+                })? {
+                    if ![curie!(MS:1003270), curie!(MS:1000866), curie!(MS:1000041)]
+                        .contains(&a.name.accession)
+                    {
+                        analyte.params.push(a.clone().into());
+                    }
+                }
+            }
+            if !protein.is_empty() {
+                analyte.proteins.push(protein);
+            }
+        }
+        Ok(analyte)
     }
     fn project_description(
         &self,
@@ -572,8 +760,26 @@ impl SpectrumRecord<'_> {
     ) -> Result<AnnotatedSpectrum<OutputMolecularFormula>, RecordError> {
         self.validate_sections()?;
         let mut spec = self.project_description()?;
-        spec.analytes = self.analytes.completed.take().unwrap().storage;
-        spec.interpretations = self.interpretations.completed.take().unwrap().storage;
+        spec.analytes = self
+            .analytes
+            .completed
+            .take()
+            .unwrap()
+            .storage
+            .into_active()
+            .map(|a| self.project_analyte(a.id, a.target))
+            .collect::<Result<_, _>>()?;
+        spec.interpretations = self
+            .interpretations
+            .completed
+            .take()
+            .unwrap()
+            .storage
+            .into_active()
+            .map(|i| {
+                self.project_interpretation(i.scope_index, i.id, i.probability, i.analyte_refs)
+            })
+            .collect::<Result<_, _>>()?;
         let peaks = self.peaks.completed.take().unwrap().storage;
         let report = self.annotations.completed.take().unwrap().storage;
         let mut alternatives = report.alternatives.into_iter();
