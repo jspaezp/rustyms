@@ -6,6 +6,7 @@ mod header;
 mod interpretation;
 mod protein_description;
 mod read;
+pub mod record;
 mod spectrum_description;
 mod write;
 
