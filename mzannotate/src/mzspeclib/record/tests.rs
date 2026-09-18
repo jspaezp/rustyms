@@ -230,17 +230,22 @@ fn all_shipped_data_records_load_and_numeric_peaks_decode() {
 #[test]
 fn modern_materialization_uses_decoded_sections() {
     let mut lib = library(
-        "<mzSpecLib>\n<Spectrum=1>\nMS:1003061|library spectrum name=test\n<Analyte=1>\nMS:1003270|proforma peptidoform ion notation=PEPTIDE/2\n<Interpretation=1>\nMS:1003163|analyte mixture members=1\n<Peaks>\n100\t1\ty2\n",
+        "<mzSpecLib>\n<Spectrum=1>\nMS:1003061|library spectrum name=test\n<Analyte=1>\nMS:1003270|proforma peptidoform ion notation=PEPTIDE/2\n[1]MS:1000885|protein accession=P1\nMS:1000888|stripped peptide sequence=PEPTIDE\n<Interpretation=1>\nMS:1003163|analyte mixture members=1\nMS:1002357|PSM-level probability=0.95\n<Peaks>\n100\t1\ty2\n",
     );
     let record = lib.reader().records().next().unwrap().unwrap();
     let spectrum = record.materialize().unwrap();
     assert_eq!(spectrum.key, 1);
     assert_eq!(spectrum.description.id, "test");
     assert_eq!(spectrum.analytes.len(), 1);
+    assert_eq!(spectrum.analytes[0].proteins[0].accession.as_deref(), Some("P1"));
+    assert!(spectrum.analytes[0].params.iter().any(|p| p.name == "stripped peptide sequence"));
+    assert_eq!(spectrum.interpretations[0].probability, Some(0.95));
+    assert_eq!(spectrum.interpretations[0].analyte_refs, [1]);
     assert_eq!(spectrum.peaks.len(), 1);
     let consumed = record.into_annotated().unwrap();
     assert_eq!(consumed.peaks, spectrum.peaks);
     assert_eq!(consumed.analytes, spectrum.analytes);
+    assert_eq!(consumed.interpretations, spectrum.interpretations);
 }
 
 #[test]

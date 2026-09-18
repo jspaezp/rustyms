@@ -1063,7 +1063,7 @@ impl<Complexity> Peptidoform<Complexity> {
     }
 
     pub(super) fn formula_into_reuse(&self, out: &mut crate::chemistry::MolecularFormula) -> bool {
-        use crate::chemistry::{MolecularFormula, OutputMolecularFormula};
+        use crate::chemistry::{MassOutputType, MolecularFormula, OutputMolecularFormula};
         use crate::sequence::IsAminoAcid;
         static RESIDUES: std::sync::LazyLock<[Option<MolecularFormula>; 26]> =
             std::sync::LazyLock::new(|| {
@@ -1095,6 +1095,11 @@ impl<Complexity> Peptidoform<Complexity> {
             match modification.as_ref() {
                 SimpleModificationInner::Formula(formula)
                 | SimpleModificationInner::Database { formula, .. } => {
+                    // The general resolver defines label order and floating-mass
+                    // association. Keep those cases on its exact path.
+                    if !formula.labels().is_empty() || formula.additional_mass() != 0.0 {
+                        return false;
+                    }
                     *out += formula;
                     true
                 }

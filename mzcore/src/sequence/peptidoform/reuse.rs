@@ -337,6 +337,24 @@ mod tests {
     }
 
     #[test]
+    fn formula_labels_keep_general_resolver_order() {
+        use crate::chemistry::AmbiguousLabel;
+        let mut ion = PeptidoformIon::pro_forma("PEPTIDE", &STATIC_ONTOLOGIES).unwrap().0;
+        let labelled = |index| Modification::Simple(std::sync::Arc::new(SimpleModificationInner::Formula(
+            crate::molecular_formula!(C 1).with_label(AmbiguousLabel::AminoAcid {
+                option: AminoAcid::Alanine, sequence_index: index, peptidoform_index: 0, peptidoform_ion_index: 0,
+            })
+        )));
+        ion.peptidoforms_mut()[0].set_n_term(vec![labelled(0)]);
+        ion.peptidoforms_mut()[0].set_c_term(vec![labelled(6)]);
+        let expected = ion.formulas();
+        let mut buffer = FormulaBuffer::default();
+        let observed = buffer.calculate(&ion);
+        assert_eq!(observed, &*expected);
+        for (a, b) in observed.iter().zip(expected.iter()) { assert_eq!(a.labels(), b.labels()); }
+    }
+
+    #[test]
     fn changing_charge_and_external_output_does_not_keep_stale_chemistry() {
         let mut scratch = ProFormaScratch::default();
         let mut output = PeptidoformIon::default();
