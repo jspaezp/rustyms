@@ -310,3 +310,50 @@ fn interpreted_properties_use_inheritance_and_retain_reported_metadata() {
         "123.4"
     );
 }
+
+#[test]
+fn records_move_to_scoped_workers_and_return_for_reuse() {
+    fn send<T: Send>() {}
+    fn sync<T: Sync>() {}
+    send::<SpectrumRecord<'_>>();
+    sync::<LibraryContext<'_>>();
+    sync::<LibraryMetadata>();
+
+    let mut lib = library(
+        "<mzSpecLib>\n<AttributeSet Spectrum=all>\nMS:1003072|spectrum origin type=MS:1003074|predicted spectrum\nMS:1000894|retention time=\"bad\n<Spectrum=1>\n<Peaks>\n100\t1\n<Spectrum=2>\n<Peaks>\n200\t2\n<Spectrum=3>\n<Peaks>\n300\t3\n",
+    );
+    // Header values are decoded at open; malformed values remain per-occurrence errors.
+    let mut reader = lib.reader();
+    let mut first = reader.empty_record();
+    let mut second = reader.empty_record();
+    assert!(reader.read_into(&mut first).unwrap());
+    assert!(reader.read_into(&mut second).unwrap());
+    let mut returned = std::thread::scope(|scope| {
+        let handles: Vec<_> = [first, second]
+            .into_iter()
+            .map(|record| {
+                scope.spawn(move || {
+                    let attrs = record.attributes().unwrap();
+                    assert!(
+                        attrs.by_accession(curie!(MS:1000894)).next().unwrap().value().is_err()
+                    );
+                    assert!(matches!(
+                        attrs.by_accession(curie!(MS:1003072)).next().unwrap().value(),
+                        Ok(ValueView::Term(_))
+                    ));
+                    record.peaks().unwrap();
+                    record
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+    });
+    let record = &mut returned[0];
+    let raw_pointer = record.raw_text().as_ptr();
+    let peak_pointer = record.peaks().unwrap().mz().as_ptr();
+    assert!(reader.read_into(record).unwrap());
+    assert_eq!(record.key(), Some(3));
+    assert_eq!(record.raw_text().as_ptr(), raw_pointer);
+    assert_eq!(record.peaks().unwrap().mz().as_ptr(), peak_pointer);
+    assert_eq!(record.peaks().unwrap().mz(), [300.0]);
+}

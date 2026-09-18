@@ -162,11 +162,9 @@ struct Raw {
     attrs: Vec<AttributeSpan>,
     scopes: Vec<Scope>,
     peaks: Range<usize>,
-    values: Reusable<DecodedValues>,
 }
 impl Raw {
     fn clear(&mut self) {
-        self.values.reset();
         self.text.clear();
         self.attrs.clear();
         self.scopes.clear();
@@ -226,6 +224,7 @@ impl<T: Default + Clear> Reusable<T> {
 #[derive(Debug)]
 struct LibraryMetadata {
     raw: Raw,
+    values: DecodedValues,
     path: Option<PathBuf>,
     source: SourceId,
 }
@@ -278,7 +277,9 @@ impl<R: BufRead> Input<R> {
     }
 }
 
-/// Library/header owner. The input is streamed; only one record is buffered at a time.
+/// Library/header owner. The input is streamed; callers control retained record count.
+/// Header values are decoded eagerly into immutable shared metadata. Malformed
+/// values remain per-occurrence diagnostics rather than failing library opening.
 #[derive(Debug)]
 pub struct MzSpecLibLibrary<'o, R: BufRead> {
     metadata: LibraryMetadata,
@@ -317,8 +318,15 @@ impl<'o, R: BufRead> MzSpecLibLibrary<'o, R> {
             raw.text.push_str(&line);
         }
         scan(&mut raw, origin, true)?;
+        let mut values = DecodedValues::default();
+        values.decode(&raw);
         Ok(Self {
-            metadata: LibraryMetadata { raw, path, source },
+            metadata: LibraryMetadata {
+                raw,
+                values,
+                path,
+                source,
+            },
             ontologies,
             input,
         })
@@ -442,6 +450,7 @@ impl<'a, R: BufRead> MzSpecLibRecordReader<'a, R> {
 pub struct SpectrumRecord<'a> {
     context: LibraryContext<'a>,
     raw: Raw,
+    values: Reusable<DecodedValues>,
     origin: SourcePosition,
     owner: RecordOwner,
     generation: u64,
@@ -474,6 +483,7 @@ impl<'a> SpectrumRecord<'a> {
         Self {
             context,
             raw: Raw::default(),
+            values: Reusable::default(),
             origin: SourcePosition {
                 source: context.metadata.source,
                 line: 0,
@@ -497,6 +507,7 @@ impl<'a> SpectrumRecord<'a> {
         self.interpretations.reset();
         self.peaks.reset();
         self.annotations.reset();
+        self.values.reset();
         self.raw.clear();
         self.context = context;
         self.loaded = false;

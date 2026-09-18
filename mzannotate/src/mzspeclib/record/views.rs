@@ -160,20 +160,17 @@ impl<'a> AttributeOccurrence<'a> {
     }
     pub fn value(&self) -> Result<ValueView<'a>, &'a RecordError> {
         let raw = self.raw();
-        let values = raw
-            .values
-            .get(|out| {
-                for attr in &raw.attrs {
-                    out.values.push(
-                        StoredValue::parse(&raw.text, attr.value.clone(), &mut out.list_values)
-                            .map_err(|message| {
-                                RecordError::new(RecordErrorKind::Malformed, message, attr.position)
-                            }),
-                    );
-                }
-                Ok(())
-            })
-            .expect("value batch stores errors per occurrence");
+        let values = match self.view.owner {
+            Owner::Record(record) if !self.reference.header => record
+                .values
+                .get(|out| {
+                    out.decode(raw);
+                    Ok(())
+                })
+                .expect("value batch stores errors per occurrence"),
+            Owner::Record(record) => &record.context.metadata.values,
+            Owner::Header(context) => &context.metadata.values,
+        };
         values.values[self.reference.index]
             .as_ref()
             .map(|v| v.view(&raw.text, &values.list_values))
@@ -241,6 +238,17 @@ pub enum ValueView<'a> {
 pub(super) struct DecodedValues {
     values: Vec<Result<StoredValue, RecordError>>,
     list_values: Vec<StoredValue>,
+}
+impl DecodedValues {
+    pub(super) fn decode(&mut self, raw: &Raw) {
+        for attr in &raw.attrs {
+            self.values.push(
+                StoredValue::parse(&raw.text, attr.value.clone(), &mut self.list_values).map_err(
+                    |message| RecordError::new(RecordErrorKind::Malformed, message, attr.position),
+                ),
+            );
+        }
+    }
 }
 impl Clear for DecodedValues {
     fn clear_reuse(&mut self) {
