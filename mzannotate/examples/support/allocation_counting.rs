@@ -82,6 +82,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
+            #[cfg(test)]
+            thread_event(0);
             self.allocs.fetch_add(1, Relaxed);
             self.requested.fetch_add(layout.size(), Relaxed);
             self.grow(layout.size());
@@ -91,6 +93,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc_zeroed(layout) };
         if !ptr.is_null() {
+            #[cfg(test)]
+            thread_event(0);
             self.allocs.fetch_add(1, Relaxed);
             self.requested.fetch_add(layout.size(), Relaxed);
             self.grow(layout.size());
@@ -98,6 +102,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
         ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        #[cfg(test)]
+        thread_event(1);
         self.frees.fetch_add(1, Relaxed);
         self.live.fetch_sub(layout.size(), Relaxed);
         unsafe { System.dealloc(ptr, layout) };
@@ -105,6 +111,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let result = unsafe { System.realloc(ptr, layout, size) };
         if !result.is_null() {
+            #[cfg(test)]
+            thread_event(2);
             self.reallocs.fetch_add(1, Relaxed);
             self.requested.fetch_add(size, Relaxed);
             self.realloc_bytes.fetch_add(size, Relaxed);
@@ -152,4 +160,38 @@ mod tests {
         assert_eq!(report.end_live_bytes, 0);
         assert_eq!(report.peak_live_bytes, 64);
     }
+}
+
+// Test-only thread-local accounting excludes allocations made by other tests or
+// the harness. Const TLS initialization and Cell operations do not allocate.
+#[cfg(test)]
+thread_local! {
+    static THREAD_COUNTS: std::cell::Cell<Option<[usize; 3]>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+fn thread_event(kind: usize) {
+    let _ = THREAD_COUNTS.try_with(|cell| {
+        if let Some(mut counts) = cell.get() {
+            counts[kind] += 1;
+            cell.set(Some(counts));
+        }
+    });
+}
+#[cfg(test)]
+pub(super) fn measure_thread(f: impl FnOnce()) -> [usize; 3] {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            THREAD_COUNTS.with(|cell| cell.set(None));
+        }
+    }
+    THREAD_COUNTS.with(|cell| {
+        assert!(cell.get().is_none(), "nested allocation measurement");
+        cell.set(Some([0; 3]));
+    });
+    let reset = Reset;
+    f();
+    let counts = THREAD_COUNTS.with(|cell| cell.get().unwrap());
+    drop(reset);
+    counts
 }

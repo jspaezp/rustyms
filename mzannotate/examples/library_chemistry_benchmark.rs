@@ -376,6 +376,41 @@ mod tests {
     use super::*;
     const LIBRARY: &str = "<mzSpecLib>\n<AttributeSet Spectrum=all>\nMS:1003072|spectrum origin type=MS:1003074|predicted spectrum\n<Spectrum=1>\n<Analyte=1>\nMS:1003270|proforma peptidoform ion notation=AC[UNIMOD:4]M[UNIMOD:35]/2\n<Peaks>\n100\t1\t?\n";
 
+    #[cfg(feature = "allocation-counting")]
+    #[test]
+    fn warmed_record_property_and_peak_views_do_not_allocate() {
+        let (header, spectrum) = LIBRARY.split_once("<Spectrum=1>").unwrap();
+        let input = format!("{header}{}", format!("<Spectrum=1>{spectrum}").repeat(101));
+        let mut library =
+            MzSpecLibLibrary::open(input.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
+        let mut reader = library.reader();
+        let mut record = reader.empty_record();
+        let inspect = |record: &SpectrumRecord<'_>| {
+            for scope in record.scopes() {
+                for attribute in scope.attributes().unwrap().iter() {
+                    std::hint::black_box(attribute.value().unwrap());
+                }
+            }
+            for peak in record.peaks().unwrap().iter() {
+                std::hint::black_box((peak.mz(), peak.intensity(), peak.annotation_field()));
+            }
+        };
+        assert!(reader.read_into(&mut record).unwrap());
+        inspect(&record);
+        let counts = allocation_counting::measure_thread(|| {
+            for _ in 0..100 {
+                assert!(reader.read_into(&mut record).unwrap());
+                inspect(&record);
+            }
+            assert!(!reader.read_into(&mut record).unwrap());
+        });
+        assert_eq!(
+            counts,
+            [0, 0, 0],
+            "allocations, frees, reallocations after warm-up"
+        );
+    }
+
     #[test]
     fn modified_analyte_counts_agree_across_worker_counts() {
         for workers in [1, 2, 4] {

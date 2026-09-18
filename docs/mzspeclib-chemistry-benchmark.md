@@ -287,3 +287,36 @@ Exact byte accounting and frees (same runs):
 | legacy / 4 / 32 | 498535555 | 87567254583 | 11179439595 | 93165038560 | 142249279 | 142341303 | 145558961 |
 
 Instrumented elapsed times are deliberately omitted from speed comparisons.
+
+### Stage audit: reuse boundary still incomplete
+
+The aggregate chemistry workload is not an allocation test of record framing
+alone. A serial stage probe skipped 100 warm-up spectra, then measured the next
+10,000 from the same HeLa gzip input. Each stage used allocator counter deltas;
+chemical results were consumed before advancing the record.
+
+| Stage | Fresh allocations / record | Reallocations / record | Growth bytes / record |
+| --- | ---: | ---: | ---: |
+| Refill record | 0 | 0.0002 | 0.3424 |
+| Spectrum/analyte metadata and typed values | 0 | 0.0001 | 0.0768 |
+| `analytes()` | 44.0963 | 8.4298 | 6394.8557 |
+| Residue/formula counting after cached analytes | 184.5095 | 5.2045 | 9654.6152 |
+| Numeric peaks and raw annotation views | 0 | 0.0006 | 1.0368 |
+
+An independent extra probe of ProForma decoding measured 17.0115 allocations and
+2.348 reallocations per record; **it is already part of `analytes()`**, not another
+stage to add to its cost. The sample differs from the full-library distribution.
+Rare reallocations in the view stages reflect buffers encountering larger records.
+
+The existing `analytes()` aliases owned legacy `Analyte`: its `owned_groups` path
+formats and reparses borrowed metadata, allocates protein/parameter objects and
+then discards nested storage on reset. Formula calculation also constructs owned
+intermediates. Retaining the outer vectors does **not** establish chemistry reuse.
+The PR must not be described as end-to-end allocation-free parsing/chemistry.
+
+A feature-gated regression test now checks zero allocations, frees **and**
+reallocations over 100 refills of an already-warmed fixture while traversing all
+scope metadata/typed values and numeric/raw peak views, including EOF invalidation.
+Test-only thread-local counters exclude other test threads. This proves the fixed
+fixture path; it does not cover chemical decoding, structured errors, new maximum
+sizes or all possible libraries.
