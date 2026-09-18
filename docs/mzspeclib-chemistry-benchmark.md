@@ -79,9 +79,10 @@ git worktree add --detach "$chemistry_main_dir" 8524b24ebfe62fa308532e61a8a12c4b
 cp Cargo.lock "$chemistry_main_dir/Cargo.lock"
 uv run --no-project python - "$chemistry_main_dir" <<'PY'
 from pathlib import Path
-import sys
+import sys, subprocess
 root = Path(sys.argv[1])
-s = Path('mzannotate/examples/library_chemistry_benchmark.rs').read_text().split('#[cfg(test)]')[0]
+# Pin the serial-baseline harness used for the timings below.
+s = subprocess.check_output(['git', 'show', 'e1aa005c:mzannotate/examples/library_chemistry_benchmark.rs'], text=True).split('#[cfg(test)]')[0]
 s = s.replace('    record::{MzSpecLibLibrary, MzSpecLibRecordReader, SpectrumRecord, ValueView},\n', '').replace('use mzcv::curie;\n', '')
 s = s.replace('#![allow(unused_crate_dependencies)]', '#![allow(unused_crate_dependencies, unused_imports, dead_code)]')
 a, b = s.index('fn record_counts('), s.index('fn main()')
@@ -171,7 +172,7 @@ Amino-acid histogram (letters with zero counts in both groups omitted):
 | Y | 197,271 | 197,256 |
 
 Verification: 158 library unit tests, eight integration tests, three doctests and
-three chemistry-example tests passed (the opt-in snapshot capture remained ignored).
+three chemistry-example tests passed at that revision (the opt-in snapshot capture remained ignored).
 The scoped-record test verifies Send/Sync bounds, shared malformed-header value
 isolation and raw/peak buffer reuse after returning from a worker.
 
@@ -196,3 +197,93 @@ Batching gives **1.47× throughput** (32% less elapsed time) in this comparison.
 Every target/decoy counter and histogram bin matched the earlier verified results
 exactly. The tradeoff is more retained buffers; peak memory was not measured.
 This does not establish an optimal batch size for other libraries or workloads.
+
+## Optional allocation instrumentation
+
+Build with `--features allocation-counting` to install a counting wrapper around
+`std::alloc::System` in this example only. With the feature disabled, neither the
+wrapper nor its atomic counter updates are compiled into the executable. No new
+dependency or library allocator is introduced.
+
+```sh
+cargo build --release --offline --locked -p mzannotate --example library_chemistry_benchmark --features allocation-counting
+target/release/examples/library_chemistry_benchmark legacy 0 ~/fasta/hela_gt20peps.mzspeclib.txt.gz
+target/release/examples/library_chemistry_benchmark legacy 4 ~/fasta/hela_gt20peps.mzspeclib.txt.gz 1
+target/release/examples/library_chemistry_benchmark legacy 4 ~/fasta/hela_gt20peps.mzspeclib.txt.gz 32
+target/release/examples/library_chemistry_benchmark record 0 ~/fasta/hela_gt20peps.mzspeclib.txt.gz
+target/release/examples/library_chemistry_benchmark record 4 ~/fasta/hela_gt20peps.mzspeclib.txt.gz 1
+target/release/examples/library_chemistry_benchmark record 4 ~/fasta/hela_gt20peps.mzspeclib.txt.gz 32
+```
+
+Legacy parallel mode uses the same bounded worker/return-channel schedule as the
+record mode, with worker-local counters merged at join. It recycles the outer
+`Vec<AnnotatedSpectrum>`; clearing it drops each spectrum's internal allocations.
+The reader still eagerly materializes spectra. Both APIs support batches of 1 or
+32 with four workers, keeping at most 4 or 128 spectrum slots respectively.
+
+Counters start after shared ontology initialization, before file/header opening,
+and finish after worker joins and reader cleanup, before printing:
+
+- `alloc_calls`: successful fresh allocations, including zeroed allocations.
+- `free_calls`: deallocations; reallocations are counted separately.
+- `realloc_calls`: successful reallocations, including those performed in place.
+- `alloc_requested_bytes`: sum of fresh allocation sizes.
+- `realloc_requested_bytes`: sum of full requested destination sizes, not bytes copied.
+- `growth_bytes`: fresh sizes plus positive realloc size increases; a churn metric.
+- `baseline_live_bytes`, `end_live_bytes`, `peak_live_bytes`: live requested Rust
+  heap bytes, including allocations retained from initialization. Peak is reset at
+  measurement start. Subtract baseline to report additional peak requested bytes.
+
+These are Rust allocator requests, not all native malloc calls. They exclude
+allocator metadata, fragmentation, thread stacks and transient storage inside
+realloc; peak live requested bytes is not process RSS. Concurrent callbacks make
+peak accounting an approximation of the physical instantaneous peak. Counters do
+not measure allocator CPU time or bytes actually copied.
+
+**Use a feature-disabled build for speed measurements.** Global atomic counters
+add contention and can distort parallel scaling. Run one process per mode; begin/
+finish assume no unrelated concurrent allocation traffic. The counter test checks
+fresh/zeroed allocations, realloc growth/shrink, free and peak accounting using an
+independent allocator instance.
+
+Current example validation: four tests pass without the feature; five with it.
+Legacy/record counters agree across 1/2/4 workers and batches of 1/2/8/32 on a
+nine-spectrum fixture, exercising partial batches and reuse. Worker and producer
+errors terminate cleanly.
+
+### Allocation results (2026-09-18)
+
+One instrumented release pass per mode on the same 948,957-spectrum gzip file.
+All six target/decoy residue histograms and carbon totals match the verified
+uninstrumented outputs exactly. Sizes below use decimal GB/MB. Allocation counts
+exclude reallocations, shown separately. Peak additional heap is peak requested
+live bytes minus the initialization baseline (~142.249 MB), not RSS.
+
+| API | Workers | Batch | Allocations | Reallocations | Growth (GB) | Additional peak (MB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| record | 0 | 1 | 218,354,683 | 13,605,134 | 15.250 | 0.733 |
+| record | 4 | 1 | 218,354,748 | 13,605,173 | 15.250 | 0.788 |
+| record | 4 | 32 | 218,355,616 | 13,606,785 | 15.251 | 2.344 |
+| legacy | 0 | 1 | 498,535,631 | 21,077,344 | 93.165 | 0.813 |
+| legacy | 4 | 1 | 498,535,675 | 21,077,344 | 93.165 | 0.993 |
+| legacy | 4 | 32 | 498,535,675 | 21,077,344 | 93.165 | 3.310 |
+
+The record workload uses about 230 fresh allocations/spectrum versus 525 for
+legacy materialization. Its cumulative growth is about 6.1× lower. This includes
+skipping unused peak/fragment decoding as well as record reuse; it does not isolate
+the contribution of reuse alone. Batching changes allocation counts very little,
+while increasing retained live storage. Batching reduces handoff
+frequency; these counters do not attribute CPU time.
+
+Exact byte accounting and frees (same runs):
+
+| API / workers / batch | Frees | Fresh requested bytes | Realloc destination bytes | Growth bytes | Baseline live | End live | Peak live |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| record / 0 / 1 | 218354564 | 13910227386 | 2805223025 | 15250063822 | 142249278 | 142341254 | 142982483 |
+| record / 4 / 1 | 218354628 | 13910243705 | 2805268136 | 15250102758 | 142249278 | 142341302 | 143037051 |
+| record / 4 / 32 | 218355496 | 13910586713 | 2807055359 | 15251341510 | 142249279 | 142341303 | 144593677 |
+| legacy / 0 / 1 | 498535512 | 87567217663 | 11179439595 | 93165001640 | 142249278 | 142341254 | 143062685 |
+| legacy / 4 / 1 | 498535555 | 87567225815 | 11179439595 | 93165009792 | 142249278 | 142341302 | 143242552 |
+| legacy / 4 / 32 | 498535555 | 87567254583 | 11179439595 | 93165038560 | 142249279 | 142341303 | 145558961 |
+
+Instrumented elapsed times are deliberately omitted from speed comparisons.

@@ -4,7 +4,7 @@ use mzannotate::mzspeclib::{
     Analyte, AnalyteTarget, MzSpecLibTextParser,
     record::{MzSpecLibLibrary, MzSpecLibRecordReader, SpectrumRecord, ValueView},
 };
-use mzcore::{ontology::STATIC_ONTOLOGIES, prelude::*};
+use mzcore::{chemistry::OutputMolecularFormula, ontology::STATIC_ONTOLOGIES, prelude::*};
 use mzcv::curie;
 use mzdata::params::{ControlledVocabulary, ParamValue};
 use std::{
@@ -16,6 +16,15 @@ use std::{
     time::Instant,
 };
 
+#[cfg(feature = "allocation-counting")]
+#[path = "support/allocation_counting.rs"]
+mod allocation_counting;
+#[cfg(feature = "allocation-counting")]
+#[global_allocator]
+static ALLOCATOR: allocation_counting::CountingAllocator =
+    allocation_counting::CountingAllocator::new();
+
+type LegacySpectrum = mzannotate::spectrum::AnnotatedSpectrum<OutputMolecularFormula>;
 type WorkResult<T> = Result<T, String>;
 #[derive(Default, Debug, PartialEq, Eq)]
 struct Counts {
@@ -186,6 +195,107 @@ fn parallel<R: BufRead>(
         Ok(totals)
     })
 }
+fn legacy_counts(spectrum: &LegacySpectrum, counts: &mut [Counts; 2]) -> WorkResult<()> {
+    let (mut predicted, mut decoy) = (false, false);
+    for p in &spectrum.description.params {
+        if p.curie().is_some_and(|c| {
+            c.controlled_vocabulary == ControlledVocabulary::MS && c.accession == 1003072
+        }) {
+            match p.value.as_str().split('|').next() {
+                Some("MS:1003074") => predicted = true,
+                Some("MS:1003195") => decoy = true,
+                _ => return Err("unknown origin".into()),
+            }
+        }
+    }
+    if !predicted && !decoy {
+        return Err("missing origin".into());
+    }
+    counts[usize::from(decoy)].analytes(&spectrum.analytes)
+}
+fn fill_legacy(
+    input: &mut impl Iterator<Item = WorkResult<LegacySpectrum>>,
+    batch: &mut Vec<LegacySpectrum>,
+    batch_size: usize,
+) -> WorkResult<()> {
+    for item in input.take(batch_size) {
+        batch.push(item?);
+    }
+    Ok(())
+}
+fn parallel_legacy<I: Iterator<Item = WorkResult<LegacySpectrum>>>(
+    mut input: I,
+    workers: usize,
+    batch_size: usize,
+) -> WorkResult<[Counts; 2]> {
+    if workers == 0 || batch_size == 0 {
+        return Err("workers and batch size must be positive".into());
+    }
+    thread::scope(|scope| {
+        let (returned_tx, returned_rx) = mpsc::sync_channel(workers);
+        let mut senders = Vec::new();
+        let mut handles = Vec::new();
+        for worker in 0..workers {
+            let (tx, rx) = mpsc::sync_channel::<Vec<LegacySpectrum>>(1);
+            let returned_tx = returned_tx.clone();
+            handles.push(scope.spawn(move || {
+                let mut counts = [Counts::default(), Counts::default()];
+                while let Ok(mut batch) = rx.recv() {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        batch.iter().try_for_each(|record| legacy_counts(record, &mut counts))
+                    }))
+                    .unwrap_or_else(|_| Err("worker panicked".into()));
+                    batch.clear();
+                    if returned_tx.send((worker, batch, result)).is_err() {
+                        break;
+                    }
+                }
+                counts
+            }));
+            senders.push(tx);
+        }
+        drop(returned_tx);
+        // Reuse the outer Vec; clearing it drops all spectrum-owned allocations.
+        let mut in_flight = 0;
+        let mut eof = false;
+        for sender in &senders {
+            let mut batch = Vec::with_capacity(batch_size);
+            fill_legacy(&mut input, &mut batch, batch_size)?;
+            eof = batch.len() < batch_size;
+            if batch.is_empty() {
+                break;
+            }
+            sender.send(batch).map_err(|_| "worker disconnected")?;
+            in_flight += 1;
+            if eof {
+                break;
+            }
+        }
+        while in_flight != 0 {
+            let (worker, mut batch, result) =
+                returned_rx.recv().map_err(|_| "workers disconnected")?;
+            in_flight -= 1;
+            result?;
+            if !eof {
+                fill_legacy(&mut input, &mut batch, batch_size)?;
+                eof = batch.len() < batch_size;
+                if !batch.is_empty() {
+                    senders[worker].send(batch).map_err(|_| "worker disconnected")?;
+                    in_flight += 1;
+                }
+            }
+        }
+        drop(senders);
+        let mut totals = [Counts::default(), Counts::default()];
+        for handle in handles {
+            let counts = handle.join().map_err(|_| "worker panicked")?;
+            for (total, count) in totals.iter_mut().zip(counts) {
+                total.add(&count);
+            }
+        }
+        Ok(totals)
+    })
+}
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().collect();
     if !(4..=5).contains(&args.len()) {
@@ -199,10 +309,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args[1] != "record" && args[1] != "legacy" {
         return Err("unknown mode".into());
     }
-    if args[1] == "legacy" && workers != 0 {
-        return Err("legacy mode is serial".into());
-    }
     std::hint::black_box(&*STATIC_ONTOLOGIES);
+    #[cfg(feature = "allocation-counting")]
+    let allocation_start = ALLOCATOR.begin();
     let start = Instant::now();
     let file = BufReader::with_capacity(256 * 1024, File::open(&args[3])?);
     let input: Box<dyn BufRead> = if args[3].ends_with(".gz") {
@@ -215,24 +324,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let mut totals = [Counts::default(), Counts::default()];
     if args[1] == "legacy" {
-        for item in MzSpecLibTextParser::open(input, None, &STATIC_ONTOLOGIES)? {
-            let spectrum = item?;
-            let (mut predicted, mut decoy) = (false, false);
-            for p in &spectrum.description.params {
-                if p.curie().is_some_and(|c| {
-                    c.controlled_vocabulary == ControlledVocabulary::MS && c.accession == 1003072
-                }) {
-                    match p.value.as_str().split('|').next() {
-                        Some("MS:1003074") => predicted = true,
-                        Some("MS:1003195") => decoy = true,
-                        _ => return Err("unknown origin".into()),
-                    }
-                }
+        let parser = MzSpecLibTextParser::open(input, None, &STATIC_ONTOLOGIES)?;
+        if workers == 0 {
+            for item in parser {
+                legacy_counts(&item?, &mut totals)?;
             }
-            if !predicted && !decoy {
-                return Err("missing origin".into());
-            }
-            totals[usize::from(decoy)].analytes(&spectrum.analytes)?;
+        } else {
+            totals = parallel_legacy(
+                parser.map(|item| item.map_err(|e| e.to_string())),
+                workers,
+                batch_size,
+            )?;
         }
     } else {
         let mut library = MzSpecLibLibrary::open(input, None, &STATIC_ONTOLOGIES)?;
@@ -246,11 +348,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             totals = parallel(&mut library, workers, batch_size)?;
         }
     }
+    let elapsed = start.elapsed();
+    #[cfg(feature = "allocation-counting")]
+    let allocations = ALLOCATOR.finish(allocation_start);
     println!(
         "mode={} workers={workers} batch={batch_size} seconds={:.6}",
         args[1],
-        start.elapsed().as_secs_f64()
+        elapsed.as_secs_f64()
     );
+    #[cfg(feature = "allocation-counting")]
+    println!("allocations {allocations:?}");
     for (label, c) in ["target", "decoy"].into_iter().zip(totals) {
         println!(
             "{label} spectra={} analytes={} residues={} carbon={} histogram={:?}",
@@ -299,8 +406,42 @@ mod tests {
                 assert_eq!(counts[0].carbon, 9 * 13);
                 assert_eq!(counts[0].residues.iter().sum::<u64>(), 9 * 3);
                 assert_eq!(counts[1], Counts::default());
+                let parser =
+                    MzSpecLibTextParser::open(input.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
+                let legacy = parallel_legacy(
+                    parser.map(|item| item.map_err(|e| e.to_string())),
+                    workers,
+                    batch_size,
+                )
+                .unwrap();
+                assert_eq!(legacy, counts);
             }
         }
+    }
+
+    #[test]
+    fn legacy_worker_and_producer_errors_terminate() {
+        let parser =
+            MzSpecLibTextParser::open(LIBRARY.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
+        let missing_origin = parser.map(|item| {
+            let mut spectrum = item.map_err(|e| e.to_string())?;
+            spectrum.description.params.clear();
+            Ok(spectrum)
+        });
+        assert!(
+            parallel_legacy(missing_origin, 4, 1)
+                .unwrap_err()
+                .contains("missing origin")
+        );
+        let parser =
+            MzSpecLibTextParser::open(LIBRARY.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
+        let interrupted = parser
+            .map(|item| item.map_err(|e| e.to_string()))
+            .chain(std::iter::once(Err("input interrupted".into())));
+        assert_eq!(
+            parallel_legacy(interrupted, 4, 1).unwrap_err(),
+            "input interrupted"
+        );
     }
 
     #[test]

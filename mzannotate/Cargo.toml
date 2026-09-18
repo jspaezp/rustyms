@@ -32,6 +32,8 @@ thin-vec = { workspace = true }
 uom = { workspace = true }
 
 [features]
+# Instrument the chemistry benchmark only; normal builds have no counter overhead.
+allocation-counting = []
 coloured-errors = ["context_error/colored"]
 isotopes = ["mzcore/isotopes"]
 
