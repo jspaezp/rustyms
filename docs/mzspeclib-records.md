@@ -144,17 +144,16 @@ places every spectrum in the target group; see the benchmark's separate main res
 ## Parallel chemistry with reusable records
 
 [library_chemistry_benchmark.rs](../mzannotate/examples/library_chemistry_benchmark.rs)
-uses scoped threads and exactly one reusable record per worker. The reader moves a
-loaded record to its worker; after decoding/counting, the worker returns ownership
-for refill. Raw text, numeric/metadata cache storage and cache-vector capacity move
+uses scoped threads and a reusable batch per worker (default: one record). The
+reader moves a loaded batch to its worker; after decoding/counting, the worker
+returns ownership for refill. Counters remain worker-local and merge at `join`. Raw text, numeric/metadata cache storage and cache-vector capacity move
 with the record. No record/raw-buffer clones or Arc-wrapped library context are
 needed. Chemical objects can still allocate during decoding.
 
 The library must outlive the scoped workers. Individual records are not shared
 concurrently. Gzip decompression and record framing stay on the reader thread;
 metadata resolution, analyte decoding and carbon counting run on workers. The
-bounded channels cap in-flight records at the worker count, rather than collecting
-the entire library. Worker errors terminate processing instead of losing records
+bounded channels cap reusable records at worker count × batch size. Worker errors terminate processing instead of losing records
 or emitting partial counts as successful results.
 
 See [chemistry benchmark methodology and results](mzspeclib-chemistry-benchmark.md)

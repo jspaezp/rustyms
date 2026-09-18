@@ -2,7 +2,7 @@
 #![allow(unused_crate_dependencies)]
 use mzannotate::mzspeclib::{
     Analyte, AnalyteTarget, MzSpecLibTextParser,
-    record::{MzSpecLibLibrary, SpectrumRecord, ValueView},
+    record::{MzSpecLibLibrary, MzSpecLibRecordReader, SpectrumRecord, ValueView},
 };
 use mzcore::{ontology::STATIC_ONTOLOGIES, prelude::*};
 use mzcv::curie;
@@ -91,26 +91,48 @@ fn record_counts(record: &SpectrumRecord<'_>, counts: &mut [Counts; 2]) -> WorkR
     }
     counts[usize::from(decoy)].analytes(record.analytes().map_err(|e| e.to_string())?)
 }
+struct Batch<'a> {
+    records: Vec<SpectrumRecord<'a>>,
+    active: usize,
+}
+impl<'a> Batch<'a> {
+    fn fill<R: BufRead>(&mut self, reader: &mut MzSpecLibRecordReader<'a, R>) -> WorkResult<()> {
+        self.active = 0;
+        for record in &mut self.records {
+            if !reader.read_into(record).map_err(|e| e.to_string())? {
+                break;
+            }
+            self.active += 1;
+        }
+        Ok(())
+    }
+}
 fn parallel<R: BufRead>(
     library: &mut MzSpecLibLibrary<'_, R>,
     workers: usize,
+    batch_size: usize,
 ) -> WorkResult<[Counts; 2]> {
+    if workers == 0 || batch_size == 0 {
+        return Err("workers and batch size must be positive".into());
+    }
     let mut reader = library.reader();
     thread::scope(|scope| {
         let (returned_tx, returned_rx) = mpsc::sync_channel(workers);
         let mut senders = Vec::new();
         let mut handles = Vec::new();
         for worker in 0..workers {
-            let (tx, rx) = mpsc::sync_channel::<SpectrumRecord<'_>>(1);
+            let (tx, rx) = mpsc::sync_channel::<Batch<'_>>(1);
             let returned_tx = returned_tx.clone();
             handles.push(scope.spawn(move || {
                 let mut counts = [Counts::default(), Counts::default()];
-                while let Ok(record) = rx.recv() {
+                while let Ok(batch) = rx.recv() {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        record_counts(&record, &mut counts)
+                        batch.records[..batch.active]
+                            .iter()
+                            .try_for_each(|record| record_counts(record, &mut counts))
                     }))
                     .unwrap_or_else(|_| Err("worker panicked".into()));
-                    if returned_tx.send((worker, record, result)).is_err() {
+                    if returned_tx.send((worker, batch, result)).is_err() {
                         break;
                     }
                 }
@@ -119,28 +141,38 @@ fn parallel<R: BufRead>(
             senders.push(tx);
         }
         drop(returned_tx);
-        // Exactly one record per worker. Workers return ownership for refill;
-        // String/Vec capacities survive each round trip. No record clones.
+        // Each worker keeps one reusable batch. Ownership returns for refill;
+        // record buffers and the batch vector retain capacity. No raw-text clones.
         let mut in_flight = 0;
+        let mut eof = false;
         for sender in &senders {
-            let mut record = reader.empty_record();
-            if !reader.read_into(&mut record).map_err(|e| e.to_string())? {
+            let mut batch = Batch {
+                records: (0..batch_size).map(|_| reader.empty_record()).collect(),
+                active: 0,
+            };
+            batch.fill(&mut reader)?;
+            eof = batch.active < batch_size;
+            if batch.active == 0 {
                 break;
             }
-            sender.send(record).map_err(|_| "worker disconnected")?;
+            sender.send(batch).map_err(|_| "worker disconnected")?;
             in_flight += 1;
+            if eof {
+                break;
+            }
         }
-        let mut eof = false;
         while in_flight != 0 {
-            let (worker, mut record, result) =
+            let (worker, mut batch, result) =
                 returned_rx.recv().map_err(|_| "workers disconnected")?;
             in_flight -= 1;
             result?;
-            if !eof && reader.read_into(&mut record).map_err(|e| e.to_string())? {
-                senders[worker].send(record).map_err(|_| "worker disconnected")?;
-                in_flight += 1;
-            } else {
-                eof = true;
+            if !eof {
+                batch.fill(&mut reader)?;
+                eof = batch.active < batch_size;
+                if batch.active != 0 {
+                    senders[worker].send(batch).map_err(|_| "worker disconnected")?;
+                    in_flight += 1;
+                }
             }
         }
         drop(senders);
@@ -156,10 +188,14 @@ fn parallel<R: BufRead>(
 }
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().collect();
-    if args.len() != 4 {
-        return Err("usage: library_chemistry_benchmark legacy|record WORKERS PATH(.gz|.txt); WORKERS=0 means serial".into());
+    if !(4..=5).contains(&args.len()) {
+        return Err("usage: library_chemistry_benchmark legacy|record WORKERS PATH(.gz|.txt) [BATCH=1]; WORKERS=0 means serial".into());
     }
     let workers: usize = args[2].parse()?;
+    let batch_size: usize = args.get(4).map_or(Ok(1), |s| s.parse())?;
+    if batch_size == 0 {
+        return Err("batch size must be positive".into());
+    }
     if args[1] != "record" && args[1] != "legacy" {
         return Err("unknown mode".into());
     }
@@ -207,11 +243,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 record_counts(&record, &mut totals)?;
             }
         } else {
-            totals = parallel(&mut library, workers)?;
+            totals = parallel(&mut library, workers, batch_size)?;
         }
     }
     println!(
-        "mode={} workers={workers} seconds={:.6}",
+        "mode={} workers={workers} batch={batch_size} seconds={:.6}",
         args[1],
         start.elapsed().as_secs_f64()
     );
@@ -238,7 +274,7 @@ mod tests {
         for workers in [1, 2, 4] {
             let mut library =
                 MzSpecLibLibrary::open(LIBRARY.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
-            let counts = parallel(&mut library, workers).unwrap();
+            let counts = parallel(&mut library, workers, 1).unwrap();
             assert_eq!(counts[0].carbon, 13); // A=3, C=3+2(CAM), M=5; oxidation adds no carbon.
             assert_eq!(counts[0].residues.iter().sum::<u64>(), 3);
             assert_eq!(counts[0].spectra, 1);
@@ -247,10 +283,31 @@ mod tests {
     }
 
     #[test]
+    fn partial_batches_do_not_recount_stale_records() {
+        let (header, spectrum) = LIBRARY.split_once("<Spectrum=1>").unwrap();
+        let mut input = header.to_owned();
+        for key in 1..=9 {
+            input.push_str(&format!("<Spectrum={key}>{spectrum}"));
+        }
+        for workers in [1, 2, 4] {
+            for batch_size in [1, 2, 8, 32] {
+                let mut library =
+                    MzSpecLibLibrary::open(input.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
+                let counts = parallel(&mut library, workers, batch_size).unwrap();
+                assert_eq!(counts[0].spectra, 9);
+                assert_eq!(counts[0].analytes, 9);
+                assert_eq!(counts[0].carbon, 9 * 13);
+                assert_eq!(counts[0].residues.iter().sum::<u64>(), 9 * 3);
+                assert_eq!(counts[1], Counts::default());
+            }
+        }
+    }
+
+    #[test]
     fn worker_error_does_not_strand_other_workers() {
         let input = LIBRARY.replace("AC[UNIMOD:4]M[UNIMOD:35]/2", "???");
         let mut library =
             MzSpecLibLibrary::open(input.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
-        assert!(parallel(&mut library, 4).unwrap_err().contains("ProForma"));
+        assert!(parallel(&mut library, 4, 8).unwrap_err().contains("ProForma"));
     }
 }

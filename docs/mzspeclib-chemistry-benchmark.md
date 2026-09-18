@@ -16,10 +16,13 @@ unique-peptide count. The example requires peptidoform analytes and a single for
 per analyte, failing rather than choosing among ambiguous formulas. Targets/decoys
 use the same explicit origin policy as the numeric benchmark.
 
-The worker implementation keeps exactly one reusable record per worker. A single
-producer decompresses gzip and frames records, then moves each loaded record to a
-worker. The worker resolves metadata, decodes analytes, counts chemistry and returns
-the record for refill. Worker-local integer counters are merged after completion.
+Each worker owns a reusable batch (default: one record). A single producer
+decompresses gzip and frames records, then moves each loaded batch to a worker.
+The worker resolves metadata, decodes analytes, counts chemistry and returns the
+batch for refill. Counters stay on each worker and merge only at `join`; the return
+channel recycles buffers, not partial sums. Storage is bounded at workers × batch
+size records; retained byte capacity depends on record sizes. Larger batches reduce
+channel handoffs while retaining more reusable buffers.
 Channels are bounded; the library outlives scoped workers. The input reader stays
 on the producer thread and does not need to implement Send. No raw buffers or decoded
 analytes are cloned for dispatch. Record caches still use `OnceCell`/`RefCell`; only
@@ -40,6 +43,8 @@ target/release/examples/library_chemistry_benchmark record 0 ~/fasta/hela_gt20pe
 # Two/four worker threads, plus the reader thread.
 target/release/examples/library_chemistry_benchmark record 2 ~/fasta/hela_gt20peps.mzspeclib.txt.gz
 target/release/examples/library_chemistry_benchmark record 4 ~/fasta/hela_gt20peps.mzspeclib.txt.gz
+# Batch 32 records per handoff, keeping at most 128 reusable records.
+target/release/examples/library_chemistry_benchmark record 4 ~/fasta/hela_gt20peps.mzspeclib.txt.gz 32
 # Existing materializing reader on this feature branch.
 target/release/examples/library_chemistry_benchmark legacy 0 ~/fasta/hela_gt20peps.mzspeclib.txt.gz
 ```
@@ -53,8 +58,8 @@ independent of worker completion order.
 
 Validation includes hand-counted modified `AC[UNIMOD:4]M[UNIMOD:35]/2` (3 residues,
 13 carbons) and `PEPTIDE/2` (7 residues, 34 carbons), matching serial/1/2/4-worker
-results. Example tests cover the modified count and a failing worker without
-stranding other workers. The package's record test checks header errors remain
+results. Example tests cover the modified count, partial final batches after buffer reuse,
+and a failing worker without stranding other workers. The package's record test checks header errors remain
 independent and records retain allocations across a worker round trip.
 
 ## Actual main baseline
@@ -77,7 +82,7 @@ from pathlib import Path
 import sys
 root = Path(sys.argv[1])
 s = Path('mzannotate/examples/library_chemistry_benchmark.rs').read_text().split('#[cfg(test)]')[0]
-s = s.replace('    record::{MzSpecLibLibrary, SpectrumRecord, ValueView},\n', '').replace('use mzcv::curie;\n', '')
+s = s.replace('    record::{MzSpecLibLibrary, MzSpecLibRecordReader, SpectrumRecord, ValueView},\n', '').replace('use mzcv::curie;\n', '')
 s = s.replace('#![allow(unused_crate_dependencies)]', '#![allow(unused_crate_dependencies, unused_imports, dead_code)]')
 a, b = s.index('fn record_counts('), s.index('fn main()')
 s = s[:a] + s[b:]
@@ -113,7 +118,8 @@ Three passes per mode, in this order:
 2. 4 workers, 2 workers, serial record, branch legacy, main;
 3. serial record, main, 2 workers, branch legacy, 4 workers.
 
-The preliminary pilot is excluded.
+These measurements predate configurable batches: workers handed off one record
+at a time. The preliminary pilot is excluded.
 
 | Mode | Three elapsed times (s) | Median (s) | Correct split |
 | --- | --- | --- | --- |
@@ -165,6 +171,28 @@ Amino-acid histogram (letters with zero counts in both groups omitted):
 | Y | 197,271 | 197,256 |
 
 Verification: 158 library unit tests, eight integration tests, three doctests and
-two chemistry-example tests passed (the opt-in snapshot capture remained ignored).
+three chemistry-example tests passed (the opt-in snapshot capture remained ignored).
 The scoped-record test verifies Send/Sync bounds, shared malformed-header value
 isolation and raw/peak buffer reuse after returning from a worker.
+
+## Reusable batch comparison (2026-09-18)
+
+The configurable-batch version keeps the same worker-local reduction. Only buffer
+handoffs change: one batch travels to a worker and back, retaining its vector and
+record allocations. The CLI defaults to one record; pass `32` explicitly for the
+configuration below. No parser code changes were needed.
+
+A six-configuration pilot tried 2/4 workers and batches of 1/8/32. Four workers
+with batches of 32 were fastest in that pilot. A separate confirmation used four
+workers in batch order 1, 32, 32, 1, 1, 32, with the same direct-gzip input and timer
+boundaries as above:
+
+| Records per handoff | Three elapsed times (s) | Median (s) | Reusable record slots |
+| --- | --- | ---: | ---: |
+| 1 | 8.961180, 8.769287, 9.467465 | 8.961180 | 4 |
+| 32 | 6.021132, 6.089533, 6.076543 | 6.076543 | 128 |
+
+Batching gives **1.47× throughput** (32% less elapsed time) in this comparison.
+Every target/decoy counter and histogram bin matched the earlier verified results
+exactly. The tradeoff is more retained buffers; peak memory was not measured.
+This does not establish an optimal batch size for other libraries or workloads.
