@@ -32,7 +32,8 @@ current record; check its return value before accessing it again.
 
 Views contain references and ranges. They can outlive temporary collection views,
 but Rust prevents replacing a record while its views are still used. Records are
-not `Sync`: lazy caches use safe `OnceCell`/`RefCell` storage. Raw peak text is still
+`Send` but not `Sync`: each worker owns its record, whose lazy caches use safe
+`OnceCell`/`RefCell` storage. The borrowed header/context is immutable and `Sync`. Raw peak text is still
 read and buffered during metadata-only traversal. Molecular objects, owned exports,
 and error construction can allocate; this is not a zero-allocation chemistry parser.
 
@@ -78,8 +79,10 @@ now succeeds even when unrequested numeric peaks or ProForma would fail.
 | Every annotation alternative | `resolved_annotations()?.iter()`, each row's `iter()` |
 | Malformed fields with zero alternatives | report `diagnostics()` |
 
-Typed metadata values are classified in one cached batch per raw backing buffer;
-outcomes are stored per occurrence. An unrelated malformed value does not hide a
+Header metadata values are classified once during `open`, with errors stored per
+occurrence rather than making malformed values fail the whole header. Record-local
+metadata values remain lazy: one cached batch per raw record buffer, with outcomes
+stored per occurrence. An unrelated malformed value does not hide a
 valid typed origin. Lexical views never copy text. Numeric conversions such as
 `to_f64()` are fallible; no missing coordinate is replaced with zero. Quantity
 selection, unit normalization, ontology ancestry, competition groups and fatality
@@ -137,3 +140,22 @@ Counts and aggregates matched. See [benchmark source, methodology and results](m
 Direct gzip loading takes 8.956 s versus 25.241 s (same workload,
 three-pass medians). Actual main (`8524b24e`) takes 22.166 s but incorrectly
 places every spectrum in the target group; see the benchmark's separate main results.
+
+## Parallel chemistry with reusable records
+
+[library_chemistry_benchmark.rs](../mzannotate/examples/library_chemistry_benchmark.rs)
+uses scoped threads and exactly one reusable record per worker. The reader moves a
+loaded record to its worker; after decoding/counting, the worker returns ownership
+for refill. Raw text, numeric/metadata cache storage and cache-vector capacity move
+with the record. No record/raw-buffer clones or Arc-wrapped library context are
+needed. Chemical objects can still allocate during decoding.
+
+The library must outlive the scoped workers. Individual records are not shared
+concurrently. Gzip decompression and record framing stay on the reader thread;
+metadata resolution, analyte decoding and carbon counting run on workers. The
+bounded channels cap in-flight records at the worker count, rather than collecting
+the entire library. Worker errors terminate processing instead of losing records
+or emitting partial counts as successful results.
+
+See [chemistry benchmark methodology and results](mzspeclib-chemistry-benchmark.md)
+for serial/parallel amino-acid and carbon counting on the supplied HeLa library.
