@@ -488,7 +488,7 @@ fn frames_parse_on_workers_and_reuse_index_and_peak_storage() {
 }
 
 #[test]
-fn direct_framing_handles_split_utf8_crlf_and_unterminated_final_line() {
+fn framing_handles_split_utf8_crlf_and_unterminated_final_line() {
     let first = "<Spectrum=1>\r\nMS:1003061|library spectrum name=μ-é\r\n<Peaks>\r\n100\t1\t?\r\n";
     let second = "<Spectrum=2>\r\n<Peaks>\r\n200\t2\t?";
     let text = format!("<mzSpecLib>\r\n{first}{second}");
@@ -520,7 +520,7 @@ fn direct_framing_handles_split_utf8_crlf_and_unterminated_final_line() {
 }
 
 #[test]
-fn direct_framing_rolls_back_partial_lines_on_io_and_utf8_errors() {
+fn framing_invalidates_partial_records_on_io_and_utf8_errors() {
     use std::io::{self, Read};
     struct Fails;
     impl Read for Fails {

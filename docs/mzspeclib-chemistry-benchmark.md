@@ -576,3 +576,43 @@ structural errors are deferred/cached with raw evidence, and EOF invalidates fra
 A compile-fail doctest ensures borrowed record views prevent frame refill. Earlier
 whole-library allocation totals precede this framing change; the warmed zero-churn
 regression was rerun on the new path.
+
+## Trimming remaining producer work
+
+After raw-frame dispatch, two further changes were evaluated: resetting decoded
+caches on the consumer before indexing, and appending body lines directly into the
+record string instead of copying through the reusable line scratch string. The
+combined experiment (`eed80bb0`) was slower, so direct appending was reverted.
+Consumer-side decoded-cache cleanup is retained: the producer now resets only raw
+framing state, and inaccessible decoded caches remain untouched until `frame.record()`.
+This moves ownership-related cleanup to the consumer but has **no demonstrated
+throughput benefit on this workload**.
+
+Matched four-worker/batch-32 release runs, allocation instrumentation disabled:
+
+| Comparison | Three before times (s) | Three after times (s) | Before median (s) | After median (s) |
+| --- | --- | --- | ---: | ---: |
+| Cleanup + direct line append | 4.035564, 3.994492, 3.972778 | 4.140610, 4.133184, 4.143352 | 3.994492 | 4.140610 |
+| Cleanup only, direct append reverted | 3.964181, 4.082440, 4.094602 | 4.088269, 4.435600, 3.986303 | 4.082440 | 4.088269 |
+
+Before is the saved raw-frame binary (`ff0a6fa1`; `949cf494` only added documentation).
+The first comparison alternated before/after, after/before, before/after; the
+cleanup-only comparison used after/before, before/after, after/before. All results
+are retained, including the slower 4.436s cleanup-only run. Every target/decoy count
+and residue histogram matched. The combined experiment also lost time in single
+serial samples (6.537s before, 6.864s after). Fewer source-level copies did not produce
+a faster executable here; these measurements do not isolate the machine-level cause.
+
+The retained code uses the original reusable line scratch path. New regression
+coverage checks split UTF-8 across tiny buffers, CRLF, a final line without newline,
+partial IO/invalid-UTF-8 errors, source positions, and invalidation. It also checks
+that decoded peak caches survive producer refill untouched and are reset before
+consumer access, so old values cannot leak into the next record.
+
+Further candidates need separate experiments: block-based boundary scanning could
+reduce per-line framing work; gzip decompression remains a substantial serial cost.
+Neither is established as a speedup by these results.
+
+Final retained implementation: 19 record tests and all eight feature-enabled
+benchmark tests pass, including warmed zero-allocation reuse. Full mzannotate
+suites passed during this change (162 library tests plus integration/doc tests).
