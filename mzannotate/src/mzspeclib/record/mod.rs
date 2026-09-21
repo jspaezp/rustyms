@@ -3,7 +3,8 @@
 //! [`MzSpecLibLibrary`] owns the header and input. Records borrow its metadata,
 //! own their raw spectrum text, and decode whole sections on first access.
 //! Use [`MzSpecLibRecordReader::read_into`] to reuse allocations, or `records()`
-//! for independent records. See `docs/mzspeclib-records.md` for usage and policies.
+//! for independent records. For worker-side structural parsing, use
+//! [`MzSpecLibRecordReader::read_frame_into`] and [`SpectrumFrame::record`]. See `docs/mzspeclib-records.md` for usage and policies.
 #![allow(missing_docs)]
 
 mod decode;
@@ -366,6 +367,31 @@ impl<'a, R: BufRead> MzSpecLibRecordReader<'a, R> {
     pub fn empty_record(&self) -> SpectrumRecord<'a> {
         SpectrumRecord::empty(self.context)
     }
+    /// Allocate an empty reusable frame without parsing a spectrum.
+    pub fn empty_frame(&self) -> SpectrumFrame<'a> {
+        SpectrumFrame {
+            record: self.empty_record(),
+            parsed: None,
+        }
+    }
+    /// Buffer a complete spectrum without parsing IDs, attributes or peak fields.
+    /// Returns false at EOF. Structural errors are deferred to `frame.record()`;
+    /// IO/UTF-8 errors remain reader errors. Existing borrowed views prevent refill.
+    pub fn read_frame_into(&mut self, frame: &mut SpectrumFrame<'a>) -> Result<bool, RecordError> {
+        frame.parsed = None;
+        frame.record.reset(self.context);
+        let outcome = self.load_frame(&mut frame.record).map_err(|e| {
+            e.with_context(
+                self.context.metadata.path.as_deref(),
+                &frame.record.raw.text,
+                frame.record.origin.byte_offset,
+            )
+        });
+        if outcome.is_err() {
+            frame.record.reset(self.context);
+        }
+        outcome
+    }
     pub fn records(
         &mut self,
     ) -> impl Iterator<Item = Result<SpectrumRecord<'a>, RecordError>> + '_ {
@@ -380,19 +406,27 @@ impl<'a, R: BufRead> MzSpecLibRecordReader<'a, R> {
     }
     pub fn read_into(&mut self, record: &mut SpectrumRecord<'a>) -> Result<bool, RecordError> {
         record.reset(self.context);
-        let outcome = self.load(record).map_err(|e| {
-            e.with_context(
-                self.context.metadata.path.as_deref(),
-                &record.raw.text,
-                record.origin.byte_offset,
-            )
-        });
+        let outcome = self
+            .load_frame(record)
+            .and_then(|loaded| {
+                if loaded {
+                    record.parse_structure()?;
+                }
+                Ok(loaded)
+            })
+            .map_err(|e| {
+                e.with_context(
+                    self.context.metadata.path.as_deref(),
+                    &record.raw.text,
+                    record.origin.byte_offset,
+                )
+            });
         if outcome.is_err() {
             record.reset(self.context);
         }
         outcome
     }
-    fn load(&mut self, record: &mut SpectrumRecord<'a>) -> Result<bool, RecordError> {
+    fn load_frame(&mut self, record: &mut SpectrumRecord<'a>) -> Result<bool, RecordError> {
         // On failure the previous record was fully consumed. Synchronize to the next declaration.
         loop {
             let Some(position) = self.input.line(&mut self.line)? else {
@@ -411,12 +445,60 @@ impl<'a, R: BufRead> MzSpecLibRecordReader<'a, R> {
             }
             record.raw.text.push_str(&self.line);
         }
-        scan(&mut record.raw, record.origin, false)?;
         record.loaded = true;
-        while record.metadata.len() < record.raw.scopes.len() {
-            record.metadata.push(Reusable::default());
-        }
         Ok(true)
+    }
+}
+
+/// Reusable unparsed spectrum text plus retained storage for consumer-side decoding.
+///
+/// The reader only frames text. `record()` indexes it once, on the calling thread,
+/// without copying its raw buffer. Later calls reuse the index or cached error.
+/// All decoded views borrow this frame and prevent it from being refilled.
+///
+/// ```compile_fail
+/// use mzannotate::mzspeclib::record::{MzSpecLibRecordReader, SpectrumFrame};
+/// use std::io::Cursor;
+/// fn invalid<'a>(reader: &mut MzSpecLibRecordReader<'a, Cursor<Vec<u8>>>,
+///                frame: &mut SpectrumFrame<'a>) {
+///     let record = frame.record().unwrap();
+///     reader.read_frame_into(frame).unwrap();
+///     println!("{:?}", record.key());
+/// }
+/// ```
+#[derive(Debug)]
+pub struct SpectrumFrame<'a> {
+    record: SpectrumRecord<'a>,
+    parsed: Option<Result<(), RecordError>>,
+}
+impl<'a> SpectrumFrame<'a> {
+    pub fn raw_text(&self) -> &str {
+        self.record.raw_text()
+    }
+    pub fn source_position(&self) -> Option<SourcePosition> {
+        self.record.source_position()
+    }
+    pub fn source_path(&self) -> Option<&Path> {
+        self.record.source_path()
+    }
+    pub fn header(&self) -> HeaderView<'_> {
+        self.record.header()
+    }
+    /// Index structural metadata on this thread. Chemistry and peaks stay lazy.
+    /// Structural failures preserve the raw text and are cached until refill.
+    pub fn record(&mut self) -> Result<&SpectrumRecord<'a>, RecordError> {
+        self.record.require()?;
+        let outcome = self.parsed.get_or_insert_with(|| {
+            self.record.parse_structure().map_err(|e| {
+                e.with_context(
+                    self.record.context.metadata.path.as_deref(),
+                    &self.record.raw.text,
+                    self.record.origin.byte_offset,
+                )
+            })
+        });
+        outcome.as_ref().map_err(Clone::clone)?;
+        Ok(&self.record)
     }
 }
 
@@ -462,6 +544,13 @@ pub struct SpectrumRecord<'a> {
     annotations: Reusable<AnnotationStorage>,
 }
 impl<'a> SpectrumRecord<'a> {
+    fn parse_structure(&mut self) -> Result<(), RecordError> {
+        scan(&mut self.raw, self.origin, false)?;
+        while self.metadata.len() < self.raw.scopes.len() {
+            self.metadata.push(Reusable::default());
+        }
+        Ok(())
+    }
     fn error(
         &self,
         kind: RecordErrorKind,

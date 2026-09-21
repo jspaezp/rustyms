@@ -41,6 +41,40 @@ after warm-up. Complex chemistry, fragment resolution, owned exports, diagnostic
 and newly encountered larger shapes can still allocate; this is not a universal
 zero-allocation guarantee.
 
+## Framing without producer-side parsing
+
+For producer/worker pipelines, use `empty_frame()` and `read_frame_into()` instead
+of `empty_record()` and `read_into()`. A `SpectrumFrame` owns the reusable record
+storage; it does not copy the text when exposing a parsed record.
+
+```rust
+let mut reader = library.reader();
+let mut frame = reader.empty_frame();
+while reader.read_frame_into(&mut frame)? {
+    // A pipeline sends the frame to its worker at this point.
+    // No IDs, attributes or peak fields have been parsed by the producer.
+    let record = frame.record()?;
+    for attribute in record.attributes()?.iter() {
+        println!("{} = {}", attribute.name(), attribute.raw_value());
+    }
+    // Return the frame to the producer after these borrowed views expire.
+}
+```
+
+`read_frame_into` only resets reusable storage, finds `<Spectrum=` line boundaries,
+and buffers the complete text with source coordinates. IO and invalid UTF-8 remain
+reader errors. `frame.record()` parses structural metadata once on the calling
+thread, retains its index, and returns a borrowed `SpectrumRecord`. Chemistry,
+metadata values, inheritance, peaks and annotations retain their existing lazy
+accessors. Structural errors are cached and leave raw text/source coordinates
+available for diagnostics until refill. EOF or IO failure invalidates the frame.
+
+The frame is `Send`, not `Sync`. Borrowed record views prevent refill, so consumers
+cannot accidentally use stale indexes. Text, indexes and nested chemistry buffers
+all survive a worker round trip. `read_into` and `records()` remain convenience
+APIs that prepare structural metadata before returning; their existing error
+behavior is unchanged. Use frames when that work belongs on a worker.
+
 ## Consumer-owned early rejection
 
 Run the executable dogfood example from the repository root:
@@ -150,14 +184,14 @@ places every spectrum in the target group; see the benchmark's separate main res
 
 [library_chemistry_benchmark.rs](../mzannotate/examples/library_chemistry_benchmark.rs)
 uses scoped threads and a reusable batch per worker (default: one record). The
-reader moves a loaded batch to its worker; after decoding/counting, the worker
+reader moves a batch of raw `SpectrumFrame`s to its worker; after indexing/decoding/counting, the worker
 returns ownership for refill. Counters remain worker-local and merge at `join`. Raw text, numeric/metadata cache storage and cache-vector capacity move
 with the record. No record/raw-buffer clones or Arc-wrapped library context are
 needed. Chemical objects can still allocate during decoding.
 
 The library must outlive the scoped workers. Individual records are not shared
 concurrently. Gzip decompression and record framing stay on the reader thread;
-metadata resolution, analyte decoding and carbon counting run on workers. The
+structural indexing, metadata resolution, analyte decoding and carbon counting run on workers. The
 bounded channels cap reusable records at worker count × batch size. Worker errors terminate processing instead of losing records
 or emitting partial counts as successful results.
 

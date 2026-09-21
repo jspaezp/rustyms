@@ -219,11 +219,54 @@ fn all_shipped_data_records_load_and_numeric_peaks_decode() {
         let input = BufReader::new(std::fs::File::open(&path).unwrap());
         let mut lib =
             MzSpecLibLibrary::open(input, Some(path.clone()), &STATIC_ONTOLOGIES).unwrap();
+        let mut framed_lib = MzSpecLibLibrary::open(
+            BufReader::new(std::fs::File::open(&path).unwrap()),
+            Some(path.clone()),
+            &STATIC_ONTOLOGIES,
+        )
+        .unwrap();
+        let mut framed_reader = framed_lib.reader();
+        let mut frame = framed_reader.empty_frame();
         for record in lib.reader().records() {
             let record = record.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            record.attributes().unwrap();
-            record.peaks().unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(framed_reader.read_frame_into(&mut frame).unwrap());
+            assert!(frame.record.raw.attrs.is_empty());
+            let framed = frame.record().unwrap();
+            assert_eq!(framed.raw_text(), record.raw_text());
+            assert_eq!(framed.key(), record.key());
+            assert_eq!(
+                framed.source_position().unwrap().line,
+                record.source_position().unwrap().line
+            );
+            assert_eq!(
+                framed.source_position().unwrap().byte_offset,
+                record.source_position().unwrap().byte_offset
+            );
+            let attributes = |record: &SpectrumRecord<'_>| {
+                record
+                    .scopes()
+                    .map(|scope| {
+                        (
+                            scope.id(),
+                            scope
+                                .attributes()
+                                .unwrap()
+                                .iter()
+                                .map(|a| {
+                                    (a.accession(), a.name().to_owned(), a.raw_value().to_owned())
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(attributes(framed), attributes(&record));
+            let peaks = record.peaks().unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let framed_peaks = framed.peaks().unwrap();
+            assert_eq!(framed_peaks.mz(), peaks.mz());
+            assert_eq!(framed_peaks.intensity(), peaks.intensity());
         }
+        assert!(!framed_reader.read_frame_into(&mut frame).unwrap());
     }
 }
 
@@ -237,8 +280,16 @@ fn modern_materialization_uses_decoded_sections() {
     assert_eq!(spectrum.key, 1);
     assert_eq!(spectrum.description.id, "test");
     assert_eq!(spectrum.analytes.len(), 1);
-    assert_eq!(spectrum.analytes[0].proteins[0].accession.as_deref(), Some("P1"));
-    assert!(spectrum.analytes[0].params.iter().any(|p| p.name == "stripped peptide sequence"));
+    assert_eq!(
+        spectrum.analytes[0].proteins[0].accession.as_deref(),
+        Some("P1")
+    );
+    assert!(
+        spectrum.analytes[0]
+            .params
+            .iter()
+            .any(|p| p.name == "stripped peptide sequence")
+    );
     assert_eq!(spectrum.interpretations[0].probability, Some(0.95));
     assert_eq!(spectrum.interpretations[0].analyte_refs, [1]);
     assert_eq!(spectrum.peaks.len(), 1);
@@ -361,4 +412,77 @@ fn records_move_to_scoped_workers_and_return_for_reuse() {
     assert_eq!(record.raw_text().as_ptr(), raw_pointer);
     assert_eq!(record.peaks().unwrap().mz().as_ptr(), peak_pointer);
     assert_eq!(record.peaks().unwrap().mz(), [300.0]);
+}
+
+#[test]
+fn frames_defer_structure_errors_and_keep_raw_evidence_until_refill() {
+    let mut lib = library(
+        "<mzSpecLib>\n<Spectrum=bad>\nnot an attribute\n<Peaks>\ninvalid\n<Spectrum=2>\n<Peaks>\n200\t2\n",
+    );
+    let mut reader = lib.reader();
+    let mut frame = reader.empty_frame();
+    assert_eq!(
+        frame.record().unwrap_err().kind(),
+        RecordErrorKind::NoRecord
+    );
+    assert!(reader.read_frame_into(&mut frame).unwrap());
+    assert!(frame.record.raw.scopes.is_empty());
+    assert!(frame.record.raw.attrs.is_empty());
+    assert!(frame.parsed.is_none());
+    let source = frame.source_position().unwrap();
+    let raw = frame.raw_text().to_owned();
+    let error = frame.record().unwrap_err();
+    assert_eq!(error.kind(), RecordErrorKind::Structure);
+    assert_eq!(frame.raw_text(), raw);
+    assert_eq!(frame.source_position(), Some(source));
+    assert!(Arc::ptr_eq(&error.0, &frame.record().unwrap_err().0));
+    assert!(reader.read_frame_into(&mut frame).unwrap());
+    assert!(frame.parsed.is_none());
+    assert_eq!(frame.record().unwrap().key(), Some(2));
+    assert_eq!(frame.record().unwrap().peaks().unwrap().mz(), [200.0]);
+    assert!(!reader.read_frame_into(&mut frame).unwrap());
+    assert!(frame.raw_text().is_empty());
+    assert!(frame.source_position().is_none());
+    assert_eq!(
+        frame.record().unwrap_err().kind(),
+        RecordErrorKind::NoRecord
+    );
+}
+
+#[test]
+fn frames_parse_on_workers_and_reuse_index_and_peak_storage() {
+    fn send<T: Send>() {}
+    send::<SpectrumFrame<'_>>();
+    let mut lib = library(
+        "<mzSpecLib>\n<Spectrum=1>\nMS:1003061|library spectrum name=one\n<Peaks>\n100\t1\n<Spectrum=2>\nMS:1003061|library spectrum name=two\n<Peaks>\n200\t2\n",
+    );
+    let mut reader = lib.reader();
+    let mut frame = reader.empty_frame();
+    assert!(reader.read_frame_into(&mut frame).unwrap());
+    assert!(frame.record.raw.attrs.is_empty());
+    let raw = frame.raw_text().as_ptr();
+    let mut frame = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                assert_eq!(frame.record().unwrap().key(), Some(1));
+                assert_eq!(frame.record().unwrap().peaks().unwrap().mz(), [100.0]);
+                frame
+            })
+            .join()
+            .unwrap()
+    });
+    assert_eq!(frame.raw_text().as_ptr(), raw);
+    let attrs = frame.record.raw.attrs.as_ptr();
+    let scopes = frame.record.raw.scopes.as_ptr();
+    let peaks = frame.record().unwrap().peaks().unwrap().mz().as_ptr();
+    assert!(reader.read_frame_into(&mut frame).unwrap());
+    assert!(frame.record.raw.attrs.is_empty());
+    assert!(frame.record.raw.scopes.is_empty());
+    let record = frame.record().unwrap();
+    assert_eq!(record.key(), Some(2));
+    assert_eq!(record.raw.attrs.as_ptr(), attrs);
+    assert_eq!(record.raw.scopes.as_ptr(), scopes);
+    assert_eq!(record.peaks().unwrap().mz().as_ptr(), peaks);
+    assert_eq!(record.peaks().unwrap().mz(), [200.0]);
+    assert_eq!(frame.raw_text().as_ptr(), raw);
 }

@@ -2,7 +2,7 @@
 #![allow(unused_crate_dependencies)]
 use mzannotate::mzspeclib::{
     Analyte, AnalyteTarget, MzSpecLibTextParser,
-    record::{MzSpecLibLibrary, MzSpecLibRecordReader, SpectrumRecord, ValueView},
+    record::{MzSpecLibLibrary, MzSpecLibRecordReader, SpectrumFrame, SpectrumRecord, ValueView},
 };
 use mzcore::{chemistry::OutputMolecularFormula, ontology::STATIC_ONTOLOGIES, prelude::*};
 use mzcv::curie;
@@ -110,14 +110,14 @@ fn record_counts(record: &SpectrumRecord<'_>, counts: &mut [Counts; 2]) -> WorkR
     Ok(())
 }
 struct Batch<'a> {
-    records: Vec<SpectrumRecord<'a>>,
+    records: Vec<SpectrumFrame<'a>>,
     active: usize,
 }
 impl<'a> Batch<'a> {
     fn fill<R: BufRead>(&mut self, reader: &mut MzSpecLibRecordReader<'a, R>) -> WorkResult<()> {
         self.active = 0;
         for record in &mut self.records {
-            if !reader.read_into(record).map_err(|e| e.to_string())? {
+            if !reader.read_frame_into(record).map_err(|e| e.to_string())? {
                 break;
             }
             self.active += 1;
@@ -185,15 +185,15 @@ fn parallel_measured<const PROFILE: bool, R: BufRead>(
                     let start = stamp::<PROFILE>();
                     let received = rx.recv();
                     account(start, &mut timing.receive);
-                    let Ok(batch) = received else {
+                    let Ok(mut batch) = received else {
                         break;
                     };
                     timing.batches += 1;
                     let start = stamp::<PROFILE>();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        batch.records[..batch.active]
-                            .iter()
-                            .try_for_each(|record| record_counts(record, &mut counts))
+                        batch.records[..batch.active].iter_mut().try_for_each(|frame| {
+                            record_counts(frame.record().map_err(|e| e.to_string())?, &mut counts)
+                        })
                     }))
                     .unwrap_or_else(|_| Err("worker panicked".into()));
                     account(start, &mut timing.work);
@@ -215,7 +215,7 @@ fn parallel_measured<const PROFILE: bool, R: BufRead>(
         let mut eof = false;
         for sender in &senders {
             let mut batch = Batch {
-                records: (0..batch_size).map(|_| reader.empty_record()).collect(),
+                records: (0..batch_size).map(|_| reader.empty_frame()).collect(),
                 active: 0,
             };
             let start = stamp::<PROFILE>();
@@ -446,9 +446,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut library = MzSpecLibLibrary::open(input, None, &STATIC_ONTOLOGIES)?;
         if workers == 0 {
             let mut reader = library.reader();
-            let mut record = reader.empty_record();
-            while reader.read_into(&mut record)? {
-                record_counts(&record, &mut totals)?;
+            let mut frame = reader.empty_frame();
+            while reader.read_frame_into(&mut frame)? {
+                record_counts(frame.record()?, &mut totals)?;
             }
         } else {
             totals = if profile {
@@ -494,13 +494,13 @@ mod tests {
 
     #[cfg(feature = "allocation-counting")]
     #[test]
-    fn warmed_record_views_chemistry_and_formulas_do_not_allocate() {
+    fn warmed_frame_views_chemistry_and_formulas_do_not_allocate() {
         let (header, spectrum) = LIBRARY.split_once("<Spectrum=1>").unwrap();
         let input = format!("{header}{}", format!("<Spectrum=1>{spectrum}").repeat(101));
         let mut library =
             MzSpecLibLibrary::open(input.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
         let mut reader = library.reader();
-        let mut record = reader.empty_record();
+        let mut frame = reader.empty_frame();
         let inspect = |record: &SpectrumRecord<'_>| {
             for scope in record.scopes() {
                 for attribute in scope.attributes().unwrap().iter() {
@@ -514,14 +514,14 @@ mod tests {
                 std::hint::black_box((peak.mz(), peak.intensity(), peak.annotation_field()));
             }
         };
-        assert!(reader.read_into(&mut record).unwrap());
-        inspect(&record);
+        assert!(reader.read_frame_into(&mut frame).unwrap());
+        inspect(frame.record().unwrap());
         let counts = allocation_counting::measure_thread(|| {
             for _ in 0..100 {
-                assert!(reader.read_into(&mut record).unwrap());
-                inspect(&record);
+                assert!(reader.read_frame_into(&mut frame).unwrap());
+                inspect(frame.record().unwrap());
             }
-            assert!(!reader.read_into(&mut record).unwrap());
+            assert!(!reader.read_frame_into(&mut frame).unwrap());
         });
         assert_eq!(
             counts,
