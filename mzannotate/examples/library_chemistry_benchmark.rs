@@ -8,12 +8,14 @@ use mzcore::{chemistry::OutputMolecularFormula, ontology::STATIC_ONTOLOGIES, pre
 use mzcv::curie;
 use mzdata::params::{ControlledVocabulary, ParamValue};
 use std::{
+    cell::Cell,
     error::Error,
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
+    rc::Rc,
     sync::mpsc,
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "allocation-counting")]
@@ -123,7 +125,43 @@ impl<'a> Batch<'a> {
         Ok(())
     }
 }
+// Timers are enabled only by MZSPECLIB_PROFILE=1. Normal worker loops are
+// monomorphized without clock reads; counters stay local and merge after join.
+#[derive(Default)]
+struct StageTimes {
+    work: Duration,
+    receive: Duration,
+    send: Duration,
+    batches: usize,
+}
+fn stamp<const PROFILE: bool>() -> Option<Instant> {
+    if PROFILE { Some(Instant::now()) } else { None }
+}
+fn account(start: Option<Instant>, total: &mut Duration) {
+    if let Some(start) = start {
+        *total += start.elapsed();
+    }
+}
+struct TimedRead<R> {
+    inner: R,
+    elapsed: Rc<Cell<Duration>>,
+}
+impl<R: Read> Read for TimedRead<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let start = Instant::now();
+        let result = self.inner.read(out);
+        self.elapsed.set(self.elapsed.get() + start.elapsed());
+        result
+    }
+}
 fn parallel<R: BufRead>(
+    library: &mut MzSpecLibLibrary<'_, R>,
+    workers: usize,
+    batch_size: usize,
+) -> WorkResult<[Counts; 2]> {
+    parallel_measured::<false, R>(library, workers, batch_size)
+}
+fn parallel_measured<const PROFILE: bool, R: BufRead>(
     library: &mut MzSpecLibLibrary<'_, R>,
     workers: usize,
     batch_size: usize,
@@ -133,6 +171,7 @@ fn parallel<R: BufRead>(
     }
     let mut reader = library.reader();
     thread::scope(|scope| {
+        let mut producer = StageTimes::default();
         let (returned_tx, returned_rx) = mpsc::sync_channel(workers);
         let mut senders = Vec::new();
         let mut handles = Vec::new();
@@ -141,18 +180,31 @@ fn parallel<R: BufRead>(
             let returned_tx = returned_tx.clone();
             handles.push(scope.spawn(move || {
                 let mut counts = [Counts::default(), Counts::default()];
-                while let Ok(batch) = rx.recv() {
+                let mut timing = StageTimes::default();
+                loop {
+                    let start = stamp::<PROFILE>();
+                    let received = rx.recv();
+                    account(start, &mut timing.receive);
+                    let Ok(batch) = received else {
+                        break;
+                    };
+                    timing.batches += 1;
+                    let start = stamp::<PROFILE>();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         batch.records[..batch.active]
                             .iter()
                             .try_for_each(|record| record_counts(record, &mut counts))
                     }))
                     .unwrap_or_else(|_| Err("worker panicked".into()));
-                    if returned_tx.send((worker, batch, result)).is_err() {
+                    account(start, &mut timing.work);
+                    let start = stamp::<PROFILE>();
+                    let sent = returned_tx.send((worker, batch, result));
+                    account(start, &mut timing.send);
+                    if sent.is_err() {
                         break;
                     }
                 }
-                counts
+                (counts, timing)
             }));
             senders.push(tx);
         }
@@ -166,37 +218,71 @@ fn parallel<R: BufRead>(
                 records: (0..batch_size).map(|_| reader.empty_record()).collect(),
                 active: 0,
             };
+            let start = stamp::<PROFILE>();
             batch.fill(&mut reader)?;
+            account(start, &mut producer.work);
             eof = batch.active < batch_size;
             if batch.active == 0 {
                 break;
             }
+            let start = stamp::<PROFILE>();
             sender.send(batch).map_err(|_| "worker disconnected")?;
+            account(start, &mut producer.send);
+            producer.batches += 1;
             in_flight += 1;
             if eof {
                 break;
             }
         }
         while in_flight != 0 {
+            let start = stamp::<PROFILE>();
             let (worker, mut batch, result) =
                 returned_rx.recv().map_err(|_| "workers disconnected")?;
+            account(start, &mut producer.receive);
             in_flight -= 1;
             result?;
             if !eof {
+                let start = stamp::<PROFILE>();
                 batch.fill(&mut reader)?;
+                account(start, &mut producer.work);
                 eof = batch.active < batch_size;
                 if batch.active != 0 {
+                    let start = stamp::<PROFILE>();
                     senders[worker].send(batch).map_err(|_| "worker disconnected")?;
+                    account(start, &mut producer.send);
+                    producer.batches += 1;
                     in_flight += 1;
                 }
             }
         }
         drop(senders);
         let mut totals = [Counts::default(), Counts::default()];
-        for handle in handles {
-            let counts = handle.join().map_err(|_| "worker panicked")?;
+        let mut profiles = Vec::new();
+        for (worker, handle) in handles.into_iter().enumerate() {
+            let (counts, timing) = handle.join().map_err(|_| "worker panicked")?;
+            if PROFILE {
+                profiles.push((worker, timing));
+            }
             for (total, count) in totals.iter_mut().zip(counts) {
                 total.add(&count);
+            }
+        }
+        if PROFILE {
+            eprintln!(
+                "profile producer fill_s={:.6} receive_s={:.6} send_s={:.6} batches={}",
+                producer.work.as_secs_f64(),
+                producer.receive.as_secs_f64(),
+                producer.send.as_secs_f64(),
+                producer.batches
+            );
+            for (worker, timing) in profiles {
+                eprintln!(
+                    "profile worker={worker} work_s={:.6} receive_s={:.6} send_s={:.6} batches={}",
+                    timing.work.as_secs_f64(),
+                    timing.receive.as_secs_f64(),
+                    timing.send.as_secs_f64(),
+                    timing.batches
+                );
             }
         }
         Ok(totals)
@@ -319,13 +405,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     std::hint::black_box(&*STATIC_ONTOLOGIES);
     #[cfg(feature = "allocation-counting")]
     let allocation_start = ALLOCATOR.begin();
+    let profile = std::env::var("MZSPECLIB_PROFILE").is_ok_and(|v| v == "1");
+    if profile && (args[1] != "record" || workers == 0) {
+        return Err("MZSPECLIB_PROFILE=1 requires record mode with WORKERS > 0".into());
+    }
+    let input_time = profile.then(|| Rc::new(Cell::new(Duration::ZERO)));
     let start = Instant::now();
     let file = BufReader::with_capacity(256 * 1024, File::open(&args[3])?);
     let input: Box<dyn BufRead> = if args[3].ends_with(".gz") {
-        Box::new(BufReader::with_capacity(
-            256 * 1024,
-            flate2::read::MultiGzDecoder::new(file),
-        ))
+        let decoder = flate2::read::MultiGzDecoder::new(file);
+        if profile {
+            Box::new(BufReader::with_capacity(
+                256 * 1024,
+                TimedRead {
+                    inner: decoder,
+                    elapsed: Rc::clone(input_time.as_ref().unwrap()),
+                },
+            ))
+        } else {
+            Box::new(BufReader::with_capacity(256 * 1024, decoder))
+        }
     } else {
         Box::new(file)
     };
@@ -352,10 +451,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 record_counts(&record, &mut totals)?;
             }
         } else {
-            totals = parallel(&mut library, workers, batch_size)?;
+            totals = if profile {
+                parallel_measured::<true, _>(&mut library, workers, batch_size)?
+            } else {
+                parallel(&mut library, workers, batch_size)?
+            };
         }
     }
     let elapsed = start.elapsed();
+    if profile {
+        eprintln!(
+            "profile gzip_read_s={:.6} (includes compressed IO; overlaps producer fill; zero for plain text)",
+            input_time.as_ref().unwrap().get().as_secs_f64()
+        );
+    }
     #[cfg(feature = "allocation-counting")]
     let allocations = ALLOCATOR.finish(allocation_start);
     println!(
@@ -465,8 +574,10 @@ mod tests {
     fn chemistry_error_keeps_storage_for_the_next_valid_record() {
         let (header, spectrum) = LIBRARY.split_once("<Spectrum=1>").unwrap();
         let invalid = spectrum.replace("AC[UNIMOD:4]M[UNIMOD:35]/2", "???");
-        let input = format!("{header}<Spectrum=1>{spectrum}<Spectrum=2>{invalid}<Spectrum=3>{spectrum}");
-        let mut library = MzSpecLibLibrary::open(input.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
+        let input =
+            format!("{header}<Spectrum=1>{spectrum}<Spectrum=2>{invalid}<Spectrum=3>{spectrum}");
+        let mut library =
+            MzSpecLibLibrary::open(input.as_bytes(), None, &STATIC_ONTOLOGIES).unwrap();
         let mut reader = library.reader();
         let mut record = reader.empty_record();
         let mut totals = [Counts::default(), Counts::default()];

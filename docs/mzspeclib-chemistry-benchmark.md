@@ -428,3 +428,93 @@ path is only 1.18× faster than new serial processing: after reducing chemistry 
 more workers provide a smaller benefit. These timings do not attribute CPU costs
 to decompression versus framing. The comparison includes reusable formula calculation
 and skipped peak/fragment materialization; it does not isolate text-parser speed.
+
+## Where parallel time goes
+
+A follow-up to `bedb0df4` adds opt-in stage timing to the same record benchmark,
+without changing scheduling or chemistry. Run without the allocation-counting
+feature:
+
+```sh
+cargo build --offline --locked --release -p mzannotate --example library_chemistry_benchmark
+MZSPECLIB_PROFILE=1 target/release/examples/library_chemistry_benchmark \
+  record 4 "$HOME/fasta/hela_gt20peps.mzspeclib.txt.gz" 32
+```
+
+Normal runs omit `MZSPECLIB_PROFILE`; normal worker loops are monomorphized without
+clock reads. Profiled runs keep timing accumulators local to each thread and print
+only after joining, with no shared timing lock or atomic counter. Gzip read timing
+uses a producer-local `Rc<Cell<Duration>>`, never accessed by workers. It wraps
+`MultiGzDecoder::read`, including underlying compressed-file IO, and reports zero
+for plain-text input. Profiling requires record mode with at least one worker.
+
+Timer meanings:
+
+- Producer `fill_s`: resetting reusable records, reading/copying raw text, scanning
+  structural metadata, and growing storage when needed. Includes gzip reads.
+- Producer `receive_s` / `send_s`: elapsed time inside the channel calls, including
+  any blocking and scheduler delay. These are not measurements of mutex hold time.
+- Worker `work_s`: metadata resolution, chemistry decoding, formula calculation and
+  counting for a complete batch, including any delays inside that work.
+- Worker `receive_s`: time awaiting the next filled batch, including startup and
+  the final disconnect. Worker `send_s`: time returning a batch for refill.
+
+All times are elapsed wall time, not CPU samples. Worker times overlap producer
+time and each other: do not add them to estimate total runtime. Gzip time is nested
+in producer time (except tiny header/setup reads outside batch filling).
+
+On the same 948,957-spectrum gzip file, every run preserved all target/decoy counts
+and histograms. One representative four-worker, batch-32 profile:
+
+| Stage | Seconds |
+| --- | ---: |
+| Whole workload | 5.468 |
+| Producer filling records | 5.440 |
+| Gzip reads, included above | 2.477 |
+| Other producer filling work, by subtraction | ~2.963 |
+| Producer receiving returned batches | 0.0016 |
+| Producer sending filled batches | 0.0211 |
+| Computation per worker | 0.355–0.357 |
+| Waiting for input per worker | 5.109–5.111 |
+| Returning batches per worker | 0.0003–0.0004 |
+
+A second batch-32 profile took 5.497s, with 5.462s producer fill and 2.483s gzip
+reads. Unprofiled batch-32 controls took 5.477s and 5.503s; instrumentation did not
+produce a visible slowdown at that batch size in this small sample. Per-batch
+clock overhead matters more for batch 1; profiled times are diagnostic measurements,
+not replacements for the earlier uninstrumented throughput medians.
+
+| Workers | Batch | Profiled total (s) | Producer fill (s) | Producer receive/send (s) | Sum of worker computation (s) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 32 | 7.164 | 5.520 | 1.617 / 0.024 | 1.521 |
+| 2 | 32 | 5.501 | 5.474 | 0.003 / 0.021 | 1.419 |
+| 4 | 32 | 5.468 | 5.440 | 0.002 / 0.021 | 1.425 |
+| 4 | 1 | 7.092 | 6.066 | 0.061 / 0.821 | 1.752 |
+| 4 | 128 | 5.349 | 5.336 | 0.0004 / 0.010 | 1.361 |
+
+Batch 1 incurs substantial handoff costs. Batch 32 already makes producer channel
+calls less than 0.5% of the total; increasing to 128 gives only a small improvement
+and retains four times as many record slots. One worker has only one reusable batch,
+so the producer must wait for it before refilling: computation and filling cannot
+overlap in that configuration. Two workers already feed enough completed batches
+back to keep the producer busy on this workload.
+
+This identifies producer throughput as the current limit at batch 32, not a shared
+chemistry mutex. Workers spend about 93% of their lifetime awaiting input. There
+are still shared modification `Arc` reference-count operations; these measurements
+do not isolate their cost or promise they will scale on a different workload.
+However, worker computation does not lengthen as worker count increases here, and
+producer channel waiting is negligible. Removing worker-side contention alone
+cannot eliminate the measured ~5.44s producer path.
+
+The next experiment worth attempting is moving structural scanning from the
+producer into worker-owned records while keeping framing and gzip reading in the
+producer. The ~2.96s residual also includes line reads, copying and reset work, so it
+is an upper bound on the measured time containing scanning, not a measurement of
+scanning alone or a promised speedup. This profiling change does not alter the API,
+record scheduling, or buffer ownership. All eight feature-enabled benchmark tests
+still pass, including warmed allocation reuse and worker-error termination.
+
+Final-source confirmation (after making profile storage conditional and clarifying
+its output label): 5.523s total, 5.490s producer fill, 2.488s gzip reads, 0.0267s
+producer channel calls, and 0.351s computation per worker. All counts matched again.
