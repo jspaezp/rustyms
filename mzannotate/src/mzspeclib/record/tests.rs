@@ -486,3 +486,77 @@ fn frames_parse_on_workers_and_reuse_index_and_peak_storage() {
     assert_eq!(record.peaks().unwrap().mz(), [200.0]);
     assert_eq!(frame.raw_text().as_ptr(), raw);
 }
+
+#[test]
+fn direct_framing_handles_split_utf8_crlf_and_unterminated_final_line() {
+    let first = "<Spectrum=1>\r\nMS:1003061|library spectrum name=μ-é\r\n<Peaks>\r\n100\t1\t?\r\n";
+    let second = "<Spectrum=2>\r\n<Peaks>\r\n200\t2\t?";
+    let text = format!("<mzSpecLib>\r\n{first}{second}");
+    for capacity in 1..=16 {
+        let mut lib = MzSpecLibLibrary::open(
+            BufReader::with_capacity(capacity, text.as_bytes()),
+            None,
+            &STATIC_ONTOLOGIES,
+        )
+        .unwrap();
+        let mut reader = lib.reader();
+        let mut frame = reader.empty_frame();
+        assert!(reader.read_frame_into(&mut frame).unwrap());
+        assert_eq!(frame.raw_text(), first);
+        assert_eq!(frame.record().unwrap().peaks().unwrap().mz(), [100.0]);
+        assert!(reader.read_frame_into(&mut frame).unwrap());
+        // Consumer caches are retained untouched until the next consumer access.
+        assert!(frame.record.peaks.completed.get().is_some());
+        assert_eq!(frame.raw_text(), second);
+        let position = frame.source_position().unwrap();
+        assert_eq!(
+            position.byte_offset,
+            ("<mzSpecLib>\r\n".len() + first.len()) as u64
+        );
+        assert_eq!(position.line, 5);
+        assert_eq!(frame.record().unwrap().peaks().unwrap().mz(), [200.0]);
+        assert!(!reader.read_frame_into(&mut frame).unwrap());
+    }
+}
+
+#[test]
+fn direct_framing_rolls_back_partial_lines_on_io_and_utf8_errors() {
+    use std::io::{self, Read};
+    struct Fails;
+    impl Read for Fails {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("interrupted fixture"))
+        }
+    }
+    let prefix = b"<mzSpecLib>\n<Spectrum=1>\n<Peaks>\n";
+    for invalid_utf8 in [false, true] {
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(if invalid_utf8 {
+            b"100\t1\t\xff\n"
+        } else {
+            b"100\t1\tpartial"
+        });
+        let input: Box<dyn Read> = if invalid_utf8 {
+            Box::new(Cursor::new(bytes))
+        } else {
+            Box::new(Cursor::new(bytes).chain(Fails))
+        };
+        let mut lib =
+            MzSpecLibLibrary::open(BufReader::with_capacity(1, input), None, &STATIC_ONTOLOGIES)
+                .unwrap();
+        let mut reader = lib.reader();
+        let mut frame = reader.empty_frame();
+        let error = reader.read_frame_into(&mut frame).unwrap_err();
+        assert_eq!(error.kind(), RecordErrorKind::Io);
+        assert_eq!(error.position().line, 3);
+        assert_eq!(error.position().byte_offset, prefix.len() as u64);
+        assert_eq!(error.source_line(), None);
+        assert!(frame.raw_text().is_empty());
+        assert!(frame.source_position().is_none());
+        assert_eq!(
+            frame.record().unwrap_err().kind(),
+            RecordErrorKind::NoRecord
+        );
+        assert!(!reader.read_frame_into(&mut frame).unwrap());
+    }
+}

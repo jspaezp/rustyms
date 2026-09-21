@@ -61,8 +61,10 @@ while reader.read_frame_into(&mut frame)? {
 }
 ```
 
-`read_frame_into` only resets reusable storage, finds `<Spectrum=` line boundaries,
-and buffers the complete text with source coordinates. IO and invalid UTF-8 remain
+`read_frame_into` resets raw framing state, finds `<Spectrum=` line boundaries,
+and buffers the complete text with source coordinates. Body lines append directly
+to the retained record string; only boundary lookahead uses a scratch string.
+Decoded-cache cleanup is deferred to the next `frame.record()` call on the consumer. IO and invalid UTF-8 remain
 reader errors. `frame.record()` parses structural metadata once on the calling
 thread, retains its index, and returns a borrowed `SpectrumRecord`. Chemistry,
 metadata values, inheritance, peaks and annotations retain their existing lazy

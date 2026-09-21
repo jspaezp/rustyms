@@ -252,6 +252,12 @@ impl<R: BufRead> Input<R> {
             std::mem::swap(buffer, &mut self.pending);
             return Ok(Some(self.pending_position));
         }
+        self.append_line(buffer)
+    }
+    // Append directly to the record's retained string: no per-line scratch copy.
+    // Header/boundary lookahead is consumed by `line` before entering this path.
+    fn append_line(&mut self, buffer: &mut String) -> Result<Option<SourcePosition>, RecordError> {
+        debug_assert!(self.pending.is_empty());
         if self.eof {
             return Ok(None);
         }
@@ -260,7 +266,10 @@ impl<R: BufRead> Input<R> {
             line: self.line,
             byte_offset: self.offset,
         };
+        let start = buffer.len();
         let count = self.reader.read_line(buffer).map_err(|e| {
+            // Keep exactly the completed lines, as the scratch-buffer path did.
+            buffer.truncate(start);
             self.eof = true;
             RecordError::new(RecordErrorKind::Io, e.to_string(), pos)
         })?;
@@ -379,7 +388,7 @@ impl<'a, R: BufRead> MzSpecLibRecordReader<'a, R> {
     /// IO/UTF-8 errors remain reader errors. Existing borrowed views prevent refill.
     pub fn read_frame_into(&mut self, frame: &mut SpectrumFrame<'a>) -> Result<bool, RecordError> {
         frame.parsed = None;
-        frame.record.reset(self.context);
+        frame.record.reset_frame(self.context);
         let outcome = self.load_frame(&mut frame.record).map_err(|e| {
             e.with_context(
                 self.context.metadata.path.as_deref(),
@@ -388,7 +397,7 @@ impl<'a, R: BufRead> MzSpecLibRecordReader<'a, R> {
             )
         });
         if outcome.is_err() {
-            frame.record.reset(self.context);
+            frame.record.reset_frame(self.context);
         }
         outcome
     }
@@ -438,12 +447,18 @@ impl<'a, R: BufRead> MzSpecLibRecordReader<'a, R> {
                 break;
             }
         }
-        while let Some(position) = self.input.line(&mut self.line)? {
-            if self.line.starts_with("<Spectrum=") {
+        loop {
+            let start = record.raw.text.len();
+            let Some(position) = self.input.append_line(&mut record.raw.text)? else {
+                break;
+            };
+            if record.raw.text[start..].starts_with("<Spectrum=") {
+                self.line.clear();
+                self.line.push_str(&record.raw.text[start..]);
+                record.raw.text.truncate(start);
                 self.input.put_back(&mut self.line, position);
                 break;
             }
-            record.raw.text.push_str(&self.line);
         }
         record.loaded = true;
         Ok(true)
@@ -489,6 +504,7 @@ impl<'a> SpectrumFrame<'a> {
     pub fn record(&mut self) -> Result<&SpectrumRecord<'a>, RecordError> {
         self.record.require()?;
         let outcome = self.parsed.get_or_insert_with(|| {
+            self.record.reset_decoded();
             self.record.parse_structure().map_err(|e| {
                 e.with_context(
                     self.record.context.metadata.path.as_deref(),
@@ -589,6 +605,10 @@ impl<'a> SpectrumRecord<'a> {
         }
     }
     fn reset(&mut self, context: LibraryContext<'a>) {
+        self.reset_decoded();
+        self.reset_frame(context);
+    }
+    fn reset_decoded(&mut self) {
         for slot in &mut self.metadata {
             slot.reset();
         }
@@ -597,6 +617,8 @@ impl<'a> SpectrumRecord<'a> {
         self.peaks.reset();
         self.annotations.reset();
         self.values.reset();
+    }
+    fn reset_frame(&mut self, context: LibraryContext<'a>) {
         self.raw.clear();
         self.context = context;
         self.loaded = false;
