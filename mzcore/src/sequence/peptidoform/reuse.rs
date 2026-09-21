@@ -71,14 +71,13 @@ impl ProFormaScratch {
                     _ => (),
                 }
             }
-            for (index, modification) in &self.modifications {
-                sequence[*index]
-                    .modifications
-                    .push(Modification::Simple(modification.clone()));
+            for (index, modification) in self.modifications.drain(..) {
+                sequence[index].modifications.push(Modification::Simple(modification));
             }
             self.replace_charge(output, charge);
             return Ok(((), Vec::new()));
         }
+        self.modifications.clear();
         if self.simple_output {
             std::mem::swap(output, &mut self.spare);
             self.simple_output = false;
@@ -337,21 +336,43 @@ mod tests {
     }
 
     #[test]
+    fn intermediate_overflow_uses_general_resolver_order() {
+        let mut ion = PeptidoformIon::pro_forma("A", &STATIC_ONTOLOGIES).unwrap().0;
+        let modification = |text| {
+            Modification::Simple(std::sync::Arc::new(SimpleModificationInner::Formula(
+                MolecularFormula::pro_forma::<false, false>(text).unwrap(),
+            )))
+        };
+        ion.peptidoforms_mut()[0].set_n_term(vec![modification("H2147483646")]);
+        ion.peptidoforms_mut()[0].set_c_term(vec![modification("H-1000")]);
+        let expected = ion.formulas();
+        let mut buffer = FormulaBuffer::default();
+        assert_eq!(buffer.calculate(&ion), &*expected);
+    }
+
+    #[test]
     fn formula_labels_keep_general_resolver_order() {
         use crate::chemistry::AmbiguousLabel;
         let mut ion = PeptidoformIon::pro_forma("PEPTIDE", &STATIC_ONTOLOGIES).unwrap().0;
-        let labelled = |index| Modification::Simple(std::sync::Arc::new(SimpleModificationInner::Formula(
-            crate::molecular_formula!(C 1).with_label(AmbiguousLabel::AminoAcid {
-                option: AminoAcid::Alanine, sequence_index: index, peptidoform_index: 0, peptidoform_ion_index: 0,
-            })
-        )));
+        let labelled = |index| {
+            Modification::Simple(std::sync::Arc::new(SimpleModificationInner::Formula(
+                crate::molecular_formula!(C 1).with_label(AmbiguousLabel::AminoAcid {
+                    option: AminoAcid::Alanine,
+                    sequence_index: index,
+                    peptidoform_index: 0,
+                    peptidoform_ion_index: 0,
+                }),
+            )))
+        };
         ion.peptidoforms_mut()[0].set_n_term(vec![labelled(0)]);
         ion.peptidoforms_mut()[0].set_c_term(vec![labelled(6)]);
         let expected = ion.formulas();
         let mut buffer = FormulaBuffer::default();
         let observed = buffer.calculate(&ion);
         assert_eq!(observed, &*expected);
-        for (a, b) in observed.iter().zip(expected.iter()) { assert_eq!(a.labels(), b.labels()); }
+        for (a, b) in observed.iter().zip(expected.iter()) {
+            assert_eq!(a.labels(), b.labels());
+        }
     }
 
     #[test]

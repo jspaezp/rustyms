@@ -1100,8 +1100,7 @@ impl<Complexity> Peptidoform<Complexity> {
                     if !formula.labels().is_empty() || formula.additional_mass() != 0.0 {
                         return false;
                     }
-                    *out += formula;
-                    true
+                    out.ref_mut_checked_add(formula).is_some()
                 }
                 SimpleModificationInner::Info(_) => true,
 
@@ -1126,7 +1125,9 @@ impl<Complexity> Peptidoform<Complexity> {
             let Some(formula) = &RESIDUES[code as usize - 'A' as usize] else {
                 return false;
             };
-            *out += formula;
+            if out.ref_mut_checked_add(formula).is_none() {
+                return false;
+            }
             for modification in &residue.modifications {
                 if !add_mod(out, modification) {
                     return false;

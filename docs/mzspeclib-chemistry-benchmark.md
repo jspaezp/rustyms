@@ -1,5 +1,9 @@
 # Chemistry counting and scoped workers
 
+The [reuse correction](#reuse-correction) below supersedes the original allocation
+and timing results. The older measurements are retained as explicit before/after
+evidence.
+
 The record API now decodes header values once at library opening and stores them
 immutably, including per-occurrence errors. Its borrowed library context is `Sync`;
 `SpectrumRecord` is `Send` but remains non-`Sync`. A compile-time trait check and a
@@ -26,7 +30,8 @@ channel handoffs while retaining more reusable buffers.
 Channels are bounded; the library outlives scoped workers. The input reader stays
 on the producer thread and does not need to implement Send. No raw buffers or decoded
 analytes are cloned for dispatch. Record caches still use `OnceCell`/`RefCell`; only
-the shared header is immutable. Chemical decoding/formula calculation still allocate.
+the shared header is immutable. The common chemistry path now reuses nested storage and formula outputs; general
+chemistry paths may still allocate (see the reuse correction below).
 A processing error terminates the run without reporting partial totals as success.
 
 Both record paths skip numeric peak decoding and fragment annotation resolution.
@@ -246,7 +251,7 @@ finish assume no unrelated concurrent allocation traffic. The counter test check
 fresh/zeroed allocations, realloc growth/shrink, free and peak accounting using an
 independent allocator instance.
 
-Current example validation: four tests pass without the feature; five with it.
+Current example validation: four tests pass without the feature; eight with it.
 Legacy/record counters agree across 1/2/4 workers and batches of 1/2/8/32 on a
 nine-spectrum fixture, exercising partial batches and reuse. Worker and producer
 errors terminate cleanly.
@@ -288,7 +293,7 @@ Exact byte accounting and frees (same runs):
 
 Instrumented elapsed times are deliberately omitted from speed comparisons.
 
-### Stage audit: reuse boundary still incomplete
+### Stage audit before the reuse correction (63f94561)
 
 The aggregate chemistry workload is not an allocation test of record framing
 alone. A serial stage probe skipped 100 warm-up spectra, then measured the next
@@ -308,7 +313,7 @@ An independent extra probe of ProForma decoding measured 17.0115 allocations and
 stage to add to its cost. The sample differs from the full-library distribution.
 Rare reallocations in the view stages reflect buffers encountering larger records.
 
-The existing `analytes()` aliases owned legacy `Analyte`: its `owned_groups` path
+At that revision, `analytes()` aliased owned legacy `Analyte`: its `owned_groups` path
 formats and reparses borrowed metadata, allocates protein/parameter objects and
 then discards nested storage on reset. Formula calculation also constructs owned
 intermediates. Retaining the outer vectors does **not** establish chemistry reuse.
@@ -320,3 +325,106 @@ scope metadata/typed values and numeric/raw peak views, including EOF invalidati
 Test-only thread-local counters exclude other test threads. This proves the fixed
 fixture path; it does not cover chemical decoding, structured errors, new maximum
 sizes or all possible libraries.
+
+## Reuse correction
+
+Implementation: `33331c38`, with a subsequent guard preserving general-resolver
+label ordering and overflow behavior for general formula modifications. Changes are in the
+parser/chemistry path, not just in the benchmark:
+
+- `analytes()` no longer builds owned protein/custom metadata through `owned_groups`.
+  Those properties remain borrowed scope views until explicit materialization.
+- Nested analyte and interpretation slots retain capacity when scopes shrink,
+  sections fail or chemistry switches between peptide, formula and unknown.
+- `ProFormaScratch` reuses peptide/residue/modification/charge storage for the
+  common linear syntax. Molecular-formula text parses into retained element storage.
+- `DecodedAnalyte::formulas()` caches borrowed formula alternatives. Unambiguous
+  linear formulas accumulate directly into retained buffers instead of allocating
+  an intermediate formula collection per residue. The old target-level `.formulas()`
+  method remains available and allocating.
+
+The reusable ProForma path is conservative: uppercase linear sequences, numeric
+UNIMOD/MOD side-chain modifications, optional nonzero integer proton charges, and
+matching placement rules. Other syntax and diagnostic-producing cases use the
+full parser. Global isotopes, ambiguous residues/modifications, glycans, cross-links
+and labelled/floating-mass formula cases use the general formula resolver when
+needed. Those fallbacks, fragment resolution, owned exports and errors can still
+allocate. This is not a universal zero-allocation guarantee for all chemistry.
+
+### Full-library allocation counts after correction
+
+One release/instrumented run per configuration; all six complete the original
+948,957-spectrum gzip workload and match every target/decoy count and histogram.
+Counts include opening, buffers, cache warm-up, worker setup and cleanup. No lookup table of previously seen spectra or ProForma strings is retained; storage is bounded by the reusable
+record slots and the largest shapes encountered. Instrumented times are not used
+for throughput comparisons.
+
+| API | Workers | Batch | Fresh allocations | Reallocations | Growth bytes | Additional peak requested bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| record | 0 | 1 | 239 | 43 | 743,880 | 740,488 |
+| record | 4 | 1 | 418 | 106 | 823,216 | 819,632 |
+| record | 4 | 32 | 5,998 | 2,692 | 3,729,360 | 3,721,808 |
+| legacy | 0 | 1 | 498,535,631 | 21,077,344 | 93,165,001,640 | 813,407 |
+| legacy | 4 | 1 | 498,535,675 | 21,077,344 | 93,165,009,792 | 956,859 |
+| legacy | 4 | 32 | 498,535,675 | 21,077,344 | 93,165,038,560 | 6,945,402 |
+
+Serial record access fell from **218,354,683 to 239 fresh allocations**, and from
+15,250,063,822 to **743,880 cumulative growth bytes**. Four-worker batch-32 storage
+has higher initialization/growth cost because 128 records retain their own buffers.
+Peak is requested live Rust heap above the initialized baseline (~142.249 MB), not
+RSS; it varies with scheduling. All these counters cover the whole run, not just
+a warmed steady-state window.
+
+### Correctness and reuse checks
+
+- Every one of the **948,957 analytes** was independently compared with the original
+  ProForma decoder, including reported charge application: full targets, all formula
+  alternatives and all formula labels matched.
+- All **12 legacy fixture snapshots** match both `63f94561` built with the current
+  lockfile and the original characterization outputs. The original snapshot
+  command refuses the older lockfile fingerprint; this separate matched-lockfile
+  comparison leaves that baseline untouched.
+- Warmed allocation tests cover complete metadata/peak/chemistry/formula access,
+  alternating long/short scopes, peptide/formula/unknown transitions, interpretation
+  reference buffers, and good → bad → good chemistry. Valid warmed decoding performs
+  zero allocations, frees or reallocations. Disposal of an owned error is outside
+  the post-error decoding measurement.
+- Core differential tests cover modifications, charges, warnings, malformed input,
+  global isotopes, ambiguous residues, cross-links, complex adducts, formula parsing
+  and custom formula labels. Conservative fallbacks preserve original results.
+- Full suites passed: mzannotate 158 library tests + 8 integration tests; mzcore
+  667 library tests (10 ignored), plus integration/doc tests. The added label-order
+  and intermediate-overflow regressions passed in the four targeted reuse tests.
+  All eight feature-enabled chemistry-example tests passed, including post-error reuse.
+
+No chemistry-counting policy changed: all analytes and chains are counted, formula
+ambiguity remains an error for this consumer, and target/decoy policy is unchanged.
+
+### Uninstrumented timings after correction
+
+Release build without `allocation-counting`, implementation `2c994c08`; subsequent
+changes add an intermediate-overflow fallback and move modification handles instead
+of cloning them. These timings precede those changes. Same gzip file, timer boundaries
+and warm file cache as above.
+Three passes, with all integer outputs verified after every run:
+
+1. record serial, legacy 4/batch-32, record 4/batch-32, legacy serial;
+2. reverse order;
+3. record 4/batch-32, record serial, legacy serial, legacy 4/batch-32.
+
+The third legacy-serial run overlapped a validation build; it was discarded and
+repeated without build traffic. Instrumented runs are excluded.
+
+| API | Workers | Batch | Three times (s) | Median (s) |
+| --- | ---: | ---: | --- | ---: |
+| record | 0 | 1 | 6.600318, 6.544904, 6.527653 | 6.544904 |
+| record | 4 | 32 | 5.548407, 5.529183, 5.545259 | 5.545259 |
+| legacy | 0 | 1 | 31.289644, 31.725339, 30.900169 | 31.289644 |
+| legacy | 4 | 32 | 24.956230, 24.997719, 24.841362 | 24.956230 |
+
+The new four-worker workload is **4.50× faster than batched legacy workers**.
+Serial record processing is **4.78× faster than serial legacy**. The new four-worker
+path is only 1.18× faster than new serial processing: after reducing chemistry work,
+more workers provide a smaller benefit. These timings do not attribute CPU costs
+to decompression versus framing. The comparison includes reusable formula calculation
+and skipped peak/fragment materialization; it does not isolate text-parser speed.
