@@ -1,8 +1,8 @@
 # Chemistry counting and scoped workers
 
 The [reuse correction](#reuse-correction) below supersedes the original allocation
-and timing results. The older measurements are retained as explicit before/after
-evidence.
+and timing results. The [raw-frame dispatch results](#raw-frame-dispatch) supersede
+its parallel timings. Older measurements remain explicit before/after evidence.
 
 The record API now decodes header values once at library opening and stores them
 immutably, including per-occurrence errors. Its borrowed library context is `Sync`;
@@ -429,7 +429,7 @@ more workers provide a smaller benefit. These timings do not attribute CPU costs
 to decompression versus framing. The comparison includes reusable formula calculation
 and skipped peak/fragment materialization; it does not isolate text-parser speed.
 
-## Where parallel time goes
+## Where parallel time went before raw-frame dispatch
 
 A follow-up to `bedb0df4` adds opt-in stage timing to the same record benchmark,
 without changing scheduling or chemistry. Run without the allocation-counting
@@ -518,3 +518,61 @@ still pass, including warmed allocation reuse and worker-error termination.
 Final-source confirmation (after making profile storage conditional and clarifying
 its output label): 5.523s total, 5.490s producer fill, 2.488s gzip reads, 0.0267s
 producer channel calls, and 0.351s computation per worker. All counts matched again.
+
+## Raw-frame dispatch
+
+Implementation `ff0a6fa1` moves structural indexing off the benchmark producer.
+`read_frame_into(&mut SpectrumFrame)` only resets retained storage, recognizes
+spectrum boundary lines and buffers UTF-8 text with source coordinates. Workers
+call `frame.record()` to index IDs, accessions, groups and attribute ranges; decoded
+values, chemistry and peaks remain lazy. Indexing reuses the same allocations and
+never copies the raw text into a second record. The existing `read_into`/`records()`
+conveniences retain their original structural-error timing.
+
+Before/after release builds have allocation counting disabled. The before binary
+is `94aa19a3`, saved before rebuilding; the after binary is `ff0a6fa1`. Both process
+the original gzip directly. Three passes ran in this order: after serial, after
+four workers, before four workers, after two workers; then reverse order; then the
+first order again. Every run matched all target/decoy counts and residue histograms.
+
+| Pipeline | Workers | Batch | Three times (s) | Median (s) |
+| --- | ---: | ---: | --- | ---: |
+| Structural index on producer | 4 | 32 | 5.615632, 5.612761, 5.566699 | 5.612761 |
+| Raw frames, serial | 0 | 1 | 6.627718, 6.619047, 6.610417 | 6.619047 |
+| Raw frames, worker-side index | 2 | 32 | 4.933237, 5.145481, 4.991462 | 4.991462 |
+| Raw frames, worker-side index | 4 | 32 | 4.016153, 4.122202, 4.016307 | 4.016307 |
+
+Four-worker runtime fell **28.4%** (1.40× throughput) relative to the matched before
+binary. Parallel execution now achieves **1.65×** serial throughput; two workers
+no longer match four. No gzip backend, channel topology, batch size or counting
+policy changed.
+
+Separate diagnostic profiles (not the timing medians above):
+
+| Stage | Two workers (s) | Four workers (s) |
+| --- | ---: | ---: |
+| Total | 5.514 | 4.183 |
+| Producer frame filling | 4.452 | 4.103 |
+| Gzip reads, included in filling | 2.824 | 2.649 |
+| Producer receiving returned batches | 1.027 | 0.047 |
+| Producer sending filled batches | 0.032 | 0.029 |
+| Sum of worker indexing/chemistry/counting | 3.535 | 3.519 |
+
+These are individual elapsed-time samples and include scheduling variability;
+worker times overlap producer time. At four workers, the producer still dominates,
+but its work is now framing/decompression rather than structural indexing. Roughly
+1.45s of the producer sample remains outside gzip reads: line handling, text copying,
+resetting storage and other framing work. It is not a pure copying or scanning
+measurement. The two-worker sample spends substantial time waiting for a reusable
+batch; additional buffering could be a separate experiment.
+
+Validation: all 160 mzannotate library tests, 8 integration tests and documentation
+tests passed. All eight feature-enabled chemistry-example tests passed, including
+zero allocations/frees/reallocations over 100 warmed **frame → index → metadata →
+chemistry/formula → peaks** refills. Shipped fixture records match the existing reader
+for raw text, keys, source positions, effective attributes and numeric peaks.
+New tests verify producer-side indexes stay empty, worker handoffs preserve storage,
+structural errors are deferred/cached with raw evidence, and EOF invalidates frames.
+A compile-fail doctest ensures borrowed record views prevent frame refill. Earlier
+whole-library allocation totals precede this framing change; the warmed zero-churn
+regression was rerun on the new path.
