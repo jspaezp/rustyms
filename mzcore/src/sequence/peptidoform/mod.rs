@@ -10,9 +10,11 @@ mod parse_sloppy;
 mod peptidoform;
 mod peptidoform_ion;
 mod peptidoform_ion_set;
+mod reuse;
 #[cfg(test)]
 mod tests;
 mod validate;
+pub use reuse::{FormulaBuffer, ProFormaScratch};
 
 pub use annotated::*;
 pub use complexity::*;

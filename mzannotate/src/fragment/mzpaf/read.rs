@@ -167,6 +167,44 @@ pub struct PeakAnnotation {
 }
 
 impl PeakAnnotation {
+    /// Parse all reported alternatives without resolving them against analyte targets.
+    pub fn parse_all<'a>(
+        line: &'a str,
+        ontologies: &Ontologies,
+    ) -> Result<Vec<Self>, BoxedError<'a, BasicKind>> {
+        parse_intermediate_representation(
+            &Context::default().lines(0, line),
+            line,
+            0..line.len(),
+            ontologies,
+        )
+    }
+
+    /// Reported ion expression, before chemical resolution.
+    pub fn ion(&self) -> &IonType {
+        &self.ion
+    }
+    /// Reported charge carriers.
+    pub fn charge(&self) -> &MolecularCharge {
+        &self.charge
+    }
+    /// Reported neutral losses.
+    pub fn neutral_losses(&self) -> &[NeutralLoss] {
+        &self.neutral_losses
+    }
+    /// Reported isotope offsets.
+    pub fn isotopes(&self) -> &[(i32, Isotope)] {
+        &self.isotopes
+    }
+    /// Reported mass deviation.
+    pub fn deviation(&self) -> Option<Tolerance<OrderedMassOverCharge>> {
+        self.deviation
+    }
+    /// Referenced analyte number (zero means no explicit target).
+    pub fn analyte_number(&self) -> u32 {
+        self.analyte_number
+    }
+
     /// Convert a peak annotation into a fragment.
     /// # Errors
     /// If the fragment refers to a non existing analyte, or if the referenced analyte is not a
@@ -177,24 +215,35 @@ impl PeakAnnotation {
         interpretation: &[(NonZeroU32, AnalyteTarget)],
         context: &Context<'a>,
     ) -> Result<Fragment<OutputMolecularFormula>, BoxedError<'a, BasicKind>> {
+        self.into_fragment_with(
+            |id| {
+                interpretation
+                    .iter()
+                    .find(|(n, _)| n.get() == id)
+                    .map(|(_, target)| target)
+            },
+            context,
+        )
+    }
+
+    /// Resolve using borrowed targets, avoiding an owned cloned target list.
+    pub(crate) fn into_fragment_with<'a, 't>(
+        self,
+        lookup: impl Fn(u32) -> Option<&'t AnalyteTarget>,
+        context: &Context<'a>,
+    ) -> Result<Fragment<OutputMolecularFormula>, BoxedError<'a, BasicKind>> {
         // Get the peptidoform (assume no cross-linkers)
         let target = if self.analyte_number == 0 {
             None
         } else {
-            Some(
-                &interpretation
-                    .iter()
-                    .find(|(n, _)| n.get() == self.analyte_number)
-                    .ok_or_else(|| {
-                        BoxedError::new(
-                            BasicKind::Error,
-                            "Invalid mzPAF analyte number",
-                            "The analyte that is referenced does not exist",
-                            context.clone(),
-                        )
-                    })?
-                    .1,
-            )
+            Some(lookup(self.analyte_number).ok_or_else(|| {
+                BoxedError::new(
+                    BasicKind::Error,
+                    "Invalid mzPAF analyte number",
+                    "The analyte that is referenced does not exist",
+                    context.clone(),
+                )
+            })?)
         };
 
         let (formula, ion) = match self.ion {
@@ -435,7 +484,9 @@ impl PeakAnnotation {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, PartialOrd, Serialize)]
-pub(crate) enum IonType {
+/// Reported mzPAF ion expression, before resolution against analyte chemistry.
+pub enum IonType {
+    /// Unknown ion, optionally with a series ordinal.
     Unknown(Option<usize>),
     /// Main series, char identifier for the series, optional sattelite label, the series number,
     /// and possibly the interpretation
@@ -446,11 +497,17 @@ pub(crate) enum IonType {
         Option<Peptidoform<SemiAmbiguous>>,
         Variant,
     ),
+    /// Immonium ion and optional modification.
     Immonium(AminoAcid, Option<SimpleModification>),
+    /// Internal fragment positions.
     Internal(usize, usize),
+    /// Named ion.
     Named(String),
+    /// Precursor ion.
     Precursor,
+    /// Reporter ion formula.
     Reporter(MolecularFormula),
+    /// Explicit molecular formula.
     Formula(MolecularFormula),
 }
 
