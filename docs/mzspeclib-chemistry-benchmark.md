@@ -2,7 +2,8 @@
 
 The [reuse correction](#reuse-correction) below supersedes the original allocation
 and timing results. The [raw-frame dispatch results](#raw-frame-dispatch) supersede
-its parallel timings. Older measurements remain explicit before/after evidence.
+its parallel timings; [chunk framing](#chunk-framing-and-line-offset-reuse) gives the
+latest results. Older measurements remain explicit before/after evidence.
 
 The record API now decodes header values once at library opening and stores them
 immutably, including per-occurrence errors. Its borrowed library context is `Sync`;
@@ -616,3 +617,65 @@ Neither is established as a speedup by these results.
 Final retained implementation: 19 record tests and all eight feature-enabled
 benchmark tests pass, including warmed zero-allocation reuse. Full mzannotate
 suites passed during this change (162 library tests plus integration/doc tests).
+
+## Chunk framing and line-offset reuse
+
+Implementation `91c209be` replaces body-line framing with scanning buffered byte
+chunks. Each spectrum owns one reusable text allocation and one reusable
+`Vec<usize>` of line ends (including an unterminated final line). Delimiters are
+recognized only at line starts, including prefixes split across chunks. Spans are
+copied directly into retained byte storage; conversion to `String` validates UTF-8
+once per frame without copying or allocating. Only header/boundary lookahead uses
+the existing scratch string. Workers use the line offsets for structural and peak
+parsing, avoiding another newline scan. Decoded-cache cleanup remains on workers.
+
+This is distinct from the rejected direct-append experiment: it removes per-body-line
+`read_line` calls/UTF-8 checks and passes the line table to consumers, rather than
+merely changing the destination of each `read_line` call. Neither gzip implementation
+nor worker/channel topology changed. `memchr`, already a transitive dependency, is
+now an explicit dependency for byte scanning. The table adds one `usize` per source
+line and retains its capacity alongside the text buffer; warmed decoding still
+performs zero allocations, frees and reallocations.
+
+Same original 948,957-spectrum gzip, allocation instrumentation disabled. Saved
+pre-change binary uses `87687902` code; after uses `91c209be`. Three paired passes:
+before/after, after/before, before/after. All target/decoy counts and residue
+histograms matched on every run.
+
+| Four workers, batch 32 | Three times (s) | Median (s) |
+| --- | --- | ---: |
+| Line-based framing | 3.976047, 3.938162, 3.910682 | 3.938162 |
+| Chunk framing + line offsets | 3.314749, 3.310237, 3.312278 | 3.312278 |
+
+Elapsed time fell **15.9%**, or **1.19× throughput**. Separate serial samples were
+6.458502s before and 5.312983s after; these are single samples, not medians.
+The measurements combine producer framing improvements and worker reuse of line
+offsets; they do not isolate the contributions of individual changes.
+
+A separate four-worker diagnostic profile:
+
+| Stage | Seconds |
+| --- | ---: |
+| Total | 3.313576 |
+| Producer filling frames | 3.144306 |
+| Gzip reads, included above | 2.488879 |
+| Producer waiting for returned buffers | 0.136104 |
+| Producer sending filled buffers | 0.029844 |
+| Computation per worker | 0.658–0.660 |
+| Waiting for input per worker | 2.650–2.652 |
+
+The remaining producer work outside gzip reads is ~0.655s in this sample, including
+boundary detection, newline indexing, copying, UTF-8 validation and raw-state reset.
+It is not a measurement of line counting alone. Gzip time includes compressed IO;
+worker timings overlap producer time and must not be added to total runtime.
+
+Validation: the full mzannotate suite passed (165 unit tests, integration/doc tests),
+plus the subsequently added terminal UTF-8 regression. All eight feature-enabled
+chemistry benchmark tests passed, including warmed frame/index/chemistry/peak reuse.
+Boundary tests cover every buffer capacity from 1 through 80 bytes, multi-chunk
+records, near-matching and mid-line delimiters, CRLF, split UTF-8, final lines without
+newlines, partial IO errors, EOF, switching between framed/line/indexed readers,
+and exact source offsets. Shipped fixtures match both reader paths. UTF-8 failure
+remains terminal even if chunk scanning has already found the next spectrum prefix.
+Earlier whole-library allocation totals predate the added line-offset tables;
+zero-allocation steady-state behavior was verified on the new implementation.
