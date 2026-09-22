@@ -341,14 +341,13 @@ impl SpectrumRecord<'_> {
         self.require()?;
         let storage = self.peaks.get(|out| {
             let mut offset = self.raw.peaks.start;
-            let first_line = self.raw.text[..offset].bytes().filter(|b| *b == b'\n').count() as u64;
-            for (number, full) in
-                self.raw.text[self.raw.peaks.clone()].split_inclusive('\n').enumerate()
-            {
+            let first_line = self.raw.line_ends.partition_point(|end| *end <= offset);
+            for (number, end) in self.raw.line_ends[first_line..].iter().copied().enumerate() {
+                let full = &self.raw.text[offset..end];
                 let line = full.trim_end_matches(['\r', '\n']);
                 let pos = SourcePosition {
                     source: self.origin.source,
-                    line: self.origin.line + first_line + number as u64,
+                    line: self.origin.line + first_line as u64 + number as u64,
                     byte_offset: self.origin.byte_offset + offset as u64,
                 };
                 if !line.trim().is_empty() && !line.starts_with('#') {

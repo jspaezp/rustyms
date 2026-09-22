@@ -560,3 +560,103 @@ fn framing_invalidates_partial_records_on_io_and_utf8_errors() {
         assert!(!reader.read_frame_into(&mut frame).unwrap());
     }
 }
+
+#[test]
+fn chunk_frames_match_line_framing_at_every_small_buffer_size() {
+    let first = format!(
+        "<Spectrum=1>\r\n<Peaks>\r\n# {} μ<Spectrum=999>\r\n<SpecX\n<Spectru\n<SpectrumX\n",
+        "x".repeat(301)
+    );
+    let frames = [
+        first.as_str(),
+        "<Spectrum=2>\n<Peaks>\n",
+        "<Spectrum=3>\n<Peaks>\n# final <Spe",
+    ];
+    let text = format!("<mzSpecLib>\r\n{}", frames.concat());
+    for capacity in 1..=80 {
+        let mut lib = MzSpecLibLibrary::open(
+            BufReader::with_capacity(capacity, text.as_bytes()),
+            None,
+            &STATIC_ONTOLOGIES,
+        )
+        .unwrap();
+        let mut reader = lib.reader();
+        let mut frame = reader.empty_frame();
+        let mut byte = "<mzSpecLib>\r\n".len();
+        let mut line = 1;
+        for (index, expected) in frames.iter().enumerate() {
+            assert!(reader.read_frame_into(&mut frame).unwrap());
+            assert_eq!(frame.raw_text(), *expected, "buffer capacity {capacity}");
+            let expected_ends = expected
+                .split_inclusive('\n')
+                .scan(0, |at, line| {
+                    *at += line.len();
+                    Some(*at)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(frame.record.raw.line_ends, expected_ends);
+            let position = frame.source_position().unwrap();
+            assert_eq!(position.byte_offset, byte as u64);
+            assert_eq!(position.line, line);
+            assert_eq!(frame.record().unwrap().key(), Some((index + 1) as u32));
+            byte += expected.len();
+            line += expected_ends.len() as u64;
+        }
+        assert!(!reader.read_frame_into(&mut frame).unwrap());
+        assert_eq!(reader.input.offset, text.len() as u64);
+        assert_eq!(reader.input.line, line);
+    }
+}
+
+#[test]
+fn chunk_lookahead_can_switch_to_line_reader_and_indexed_access() {
+    let text = "<mzSpecLib>\n<Spectrum=1>\n<Peaks>\n100\t1\n<Spectrum=2>\n<Peaks>\n200\t2\n<Spectrum=3>\n<Peaks>\n300\t3";
+    let mut lib = library(text);
+    let mut reader = lib.reader();
+    let mut frame = reader.empty_frame();
+    let mut record = reader.empty_record();
+    assert!(reader.read_frame_into(&mut frame).unwrap());
+    assert_eq!(frame.record().unwrap().key(), Some(1));
+    assert_eq!(reader.build_index().unwrap(), 3);
+    assert!(reader.read_into(&mut record).unwrap());
+    assert_eq!(record.key(), Some(2));
+    assert!(reader.read_frame_into(&mut frame).unwrap());
+    assert_eq!(frame.record().unwrap().key(), Some(3));
+    assert_eq!(frame.record().unwrap().peaks().unwrap().mz(), [300.0]);
+    assert!(!reader.read_frame_into(&mut frame).unwrap());
+    assert!(reader.read_by_index_into(0, &mut record).unwrap());
+    assert_eq!(record.key(), Some(1));
+    assert!(reader.read_frame_into(&mut frame).unwrap());
+    assert_eq!(frame.record().unwrap().key(), Some(2));
+}
+
+#[test]
+fn chunk_frame_counts_unterminated_first_declaration_once() {
+    let mut lib = library("<mzSpecLib>\n<Spectrum=1>");
+    let mut reader = lib.reader();
+    let mut frame = reader.empty_frame();
+    assert!(reader.read_frame_into(&mut frame).unwrap());
+    assert_eq!(frame.record.raw.line_ends, [12]);
+    assert_eq!(reader.input.line, 2);
+    assert_eq!(
+        frame.record().unwrap_err().kind(),
+        RecordErrorKind::Structure
+    );
+    assert!(!reader.read_frame_into(&mut frame).unwrap());
+}
+
+#[test]
+fn chunk_utf8_error_remains_terminal_despite_boundary_lookahead() {
+    let input = b"<mzSpecLib>\n<Spectrum=1>\n<Peaks>\n100\t1\t\xff\n<Spectrum=2>\n<Peaks>\n";
+    let mut lib = MzSpecLibLibrary::open(&input[..], None, &STATIC_ONTOLOGIES).unwrap();
+    let mut reader = lib.reader();
+    let mut frame = reader.empty_frame();
+    let error = reader.read_frame_into(&mut frame).unwrap_err();
+    assert_eq!(error.kind(), RecordErrorKind::Io);
+    assert_eq!(error.position().line, 3);
+    assert_eq!(
+        error.position().byte_offset,
+        b"<mzSpecLib>\n<Spectrum=1>\n<Peaks>\n".len() as u64
+    );
+    assert!(!reader.read_frame_into(&mut frame).unwrap());
+}

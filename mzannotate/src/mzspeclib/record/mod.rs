@@ -160,6 +160,7 @@ struct Scope {
 #[derive(Debug, Default)]
 struct Raw {
     text: String,
+    line_ends: Vec<usize>,
     attrs: Vec<AttributeSpan>,
     scopes: Vec<Scope>,
     peaks: Range<usize>,
@@ -167,6 +168,7 @@ struct Raw {
 impl Raw {
     fn clear(&mut self) {
         self.text.clear();
+        self.line_ends.clear();
         self.attrs.clear();
         self.scopes.clear();
         self.peaks = 0..0;
@@ -380,7 +382,7 @@ impl<'a, R: BufRead> MzSpecLibRecordReader<'a, R> {
     pub fn read_frame_into(&mut self, frame: &mut SpectrumFrame<'a>) -> Result<bool, RecordError> {
         frame.parsed = None;
         frame.record.reset_frame(self.context);
-        let outcome = self.load_frame(&mut frame.record).map_err(|e| {
+        let outcome = self.load_chunks(&mut frame.record).map_err(|e| {
             e.with_context(
                 self.context.metadata.path.as_deref(),
                 &frame.record.raw.text,
@@ -425,6 +427,131 @@ impl<'a, R: BufRead> MzSpecLibRecordReader<'a, R> {
             record.reset(self.context);
         }
         outcome
+    }
+    // Buffer whole spans; scan newline offsets and the boundary prefix in-place.
+    // The String allocation is temporarily a Vec<u8>, then validated once and
+    // returned to the same String without copying. No unsafe UTF-8 assumptions.
+    fn load_chunks(&mut self, record: &mut SpectrumRecord<'a>) -> Result<bool, RecordError> {
+        loop {
+            let Some(position) = self.input.line(&mut self.line)? else {
+                return Ok(false);
+            };
+            if self.line.starts_with("<Spectrum=") {
+                record.origin = position;
+                break;
+            }
+        }
+        let mut bytes = std::mem::take(&mut record.raw.text).into_bytes();
+        bytes.extend_from_slice(self.line.as_bytes());
+        record
+            .raw
+            .line_ends
+            .extend(memchr::memchr_iter(b'\n', &bytes).map(|i| i + 1));
+        let result = self.copy_chunks(&mut bytes, &mut record.raw.line_ends, record.origin);
+        if result.is_err() {
+            // A partial failing line was never exposed by the line-based reader.
+            bytes.truncate(record.raw.line_ends.last().copied().unwrap_or(0));
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => record.raw.text = text,
+            Err(error) => {
+                // Match the line reader's terminal UTF-8 failure behavior.
+                self.input.eof = true;
+                self.input.pending.clear();
+                let valid = error.utf8_error().valid_up_to();
+                let line = record.raw.line_ends.partition_point(|end| *end <= valid);
+                let start = line.checked_sub(1).map_or(0, |i| record.raw.line_ends[i]);
+                let mut bytes = error.into_bytes();
+                bytes.truncate(start);
+                record.raw.text = String::from_utf8(bytes).expect("prefix before invalid UTF-8");
+                return Err(RecordError::new(
+                    RecordErrorKind::Io,
+                    "stream did not contain valid UTF-8",
+                    SourcePosition {
+                        source: record.origin.source,
+                        line: record.origin.line + line as u64,
+                        byte_offset: record.origin.byte_offset + start as u64,
+                    },
+                ));
+            }
+        }
+        result?;
+        record.loaded = true;
+        Ok(true)
+    }
+    fn copy_chunks(
+        &mut self,
+        bytes: &mut Vec<u8>,
+        ends: &mut Vec<usize>,
+        origin: SourcePosition,
+    ) -> Result<(), RecordError> {
+        const PREFIX: &[u8] = b"<Spectrum=";
+        let mut line_start = bytes.last() == Some(&b'\n');
+        let mut matched = 0;
+        loop {
+            let chunk = self.input.reader.fill_buf().map_err(|e| {
+                self.input.eof = true;
+                RecordError::new(
+                    RecordErrorKind::Io,
+                    e.to_string(),
+                    SourcePosition {
+                        source: origin.source,
+                        line: origin.line + ends.len() as u64,
+                        byte_offset: origin.byte_offset + ends.last().copied().unwrap_or(0) as u64,
+                    },
+                )
+            })?;
+            if chunk.is_empty() {
+                self.input.eof = true;
+                if bytes.last().is_some_and(|b| *b != b'\n') {
+                    ends.push(bytes.len());
+                    self.input.line = origin.line + ends.len() as u64;
+                }
+                return Ok(());
+            }
+            let previous_lines = ends.len();
+            let mut at = 0;
+            let mut boundary = false;
+            while at < chunk.len() {
+                if line_start {
+                    while at < chunk.len() && chunk[at] == PREFIX[matched] {
+                        at += 1;
+                        matched += 1;
+                        if matched == PREFIX.len() {
+                            boundary = true;
+                            break;
+                        }
+                    }
+                    if boundary || at == chunk.len() {
+                        break;
+                    }
+                    matched = 0;
+                    line_start = false;
+                }
+                if let Some(newline) = memchr::memchr(b'\n', &chunk[at..]) {
+                    at += newline + 1;
+                    ends.push(bytes.len() + at);
+                    line_start = true;
+                } else {
+                    at = chunk.len();
+                }
+            }
+            bytes.extend_from_slice(&chunk[..at]);
+            self.input.reader.consume(at);
+            self.input.offset += at as u64;
+            self.input.line += (ends.len() - previous_lines) as u64;
+            if boundary {
+                bytes.truncate(bytes.len() - PREFIX.len());
+                self.input.pending.clear();
+                self.input.pending.push_str("<Spectrum=");
+                self.input.pending_position = SourcePosition {
+                    source: origin.source,
+                    line: self.input.line,
+                    byte_offset: self.input.offset - PREFIX.len() as u64,
+                };
+                return Ok(());
+            }
+        }
     }
     fn load_frame(&mut self, record: &mut SpectrumRecord<'a>) -> Result<bool, RecordError> {
         // On failure the previous record was fully consumed. Synchronize to the next declaration.
@@ -706,7 +833,15 @@ fn declaration(line: &str, prefix: &str, pos: SourcePosition) -> Result<Id, Reco
 fn scan(raw: &mut Raw, origin: SourcePosition, header: bool) -> Result<(), RecordError> {
     let mut offset = 0;
     let mut peaks = false;
-    for (line_number, full) in raw.text.split_inclusive('\n').enumerate() {
+    if raw.line_ends.is_empty() {
+        raw.line_ends
+            .extend(memchr::memchr_iter(b'\n', raw.text.as_bytes()).map(|i| i + 1));
+        if !raw.text.is_empty() && !raw.text.ends_with('\n') {
+            raw.line_ends.push(raw.text.len());
+        }
+    }
+    for (line_number, end) in raw.line_ends.iter().copied().enumerate() {
+        let full = &raw.text[offset..end];
         let line = full.trim_end_matches(['\r', '\n']);
         let position = SourcePosition {
             source: origin.source,

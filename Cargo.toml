@@ -45,6 +45,7 @@ clap = { version = "4.6", features = ["derive", "cargo"] }
 context_error = { version = "0.3.0", features = ["serde"] }
 directories = "6.0"
 flate2 = "1.0"
+memchr = "2"
 indexmap = "2.11"
 itertools = ">0.12, <=0.15"
 mzdata = { version = ">0.59, <=0.65", default-features = false, features = ["nalgebra"] }

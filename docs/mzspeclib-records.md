@@ -62,8 +62,15 @@ while reader.read_frame_into(&mut frame)? {
 ```
 
 `read_frame_into` resets raw framing state, finds `<Spectrum=` line boundaries,
-and buffers the complete text with source coordinates. Decoded-cache cleanup is
-deferred to the next `frame.record()` call on the consumer. IO and invalid UTF-8 remain
+and buffers the complete text with source coordinates. It scans buffered byte chunks,
+copies spans into one retained text allocation, and records line ends in one retained
+`Vec<usize>`. Delimiter prefixes may cross chunks; only spectrum-boundary lookahead
+uses a small scratch string. The text allocation temporarily becomes a `Vec<u8>`
+while filling and converts back to `String` without copying after one UTF-8 check.
+Worker structural/peak parsing uses the saved line ends without searching for newlines
+again. Decoded-cache cleanup is deferred to `frame.record()` on the consumer.
+The offset table costs one `usize` per source line, retained up to the largest frame
+seen by that reusable slot. IO and invalid UTF-8 remain
 reader errors. `frame.record()` parses structural metadata once on the calling
 thread, retains its index, and returns a borrowed `SpectrumRecord`. Chemistry,
 metadata values, inheritance, peaks and annotations retain their existing lazy
