@@ -679,3 +679,40 @@ and exact source offsets. Shipped fixtures match both reader paths. UTF-8 failur
 remains terminal even if chunk scanning has already found the next spectrum prefix.
 Earlier whole-library allocation totals predate the added line-offset tables;
 zero-allocation steady-state behavior was verified on the new implementation.
+
+## Measured uncompressed-file performance
+
+This is a direct measurement, not gzip-stage subtraction. The same source library
+was decompressed once to a gitignored temporary file (1,359,658,233 bytes) **before**
+benchmarking. Release code is `91c209be` (current documentation HEAD `a238f15a`),
+without allocator instrumentation. One four-worker warm-up preceded three measured
+serial/four-worker pairs, ordered serial/parallel, parallel/serial, serial/parallel.
+Every run, including warm-up and the separate stage profile, matched all target/decoy
+counts and residue histograms for all 948,957 spectra.
+
+| Mode | Workers | Batch | Three measured times (s) | Median (s) |
+| --- | ---: | ---: | --- | ---: |
+| Serial records | 0 | 1 | 2.926835, 2.935362, 2.960153 | 2.935362 |
+| Worker-owned records | 4 | 32 | 0.936857, 0.942162, 0.968015 | 0.942162 |
+
+Four workers achieve **3.12×** the serial throughput on this workload. These are
+warm filesystem-cache reads, not an in-memory-only benchmark or cold-disk results.
+Timing includes opening/reading the plain file, framing, indexing, chemistry and
+counting; ontology initialization remains outside the timer as in the gzip runs.
+The temporary uncompressed file was removed after measurement.
+
+Reproduce from the repository root:
+
+```sh
+gzip -dc "$HOME/fasta/hela_gt20peps.mzspeclib.txt.gz" > .local-design/hela_gt20peps.mzspeclib.txt
+cargo build --offline --locked --release -p mzannotate --example library_chemistry_benchmark
+target/release/examples/library_chemistry_benchmark record 0 .local-design/hela_gt20peps.mzspeclib.txt
+target/release/examples/library_chemistry_benchmark record 4 .local-design/hela_gt20peps.mzspeclib.txt 32
+```
+
+A separate instrumented stage profile took 1.141s (slower than the uninstrumented
+runs): producer fill 0.782s, producer receive 0.318s, producer send 0.039s; worker
+computation 0.749–0.760s each. Gzip time was zero. Treat these as diagnostic samples,
+not a breakdown of the 0.942s median: timing probes and scheduling can perturb the
+pipeline. They suggest buffer availability/coordination is more relevant without
+gzip, but do not establish that double buffering will improve throughput.
